@@ -1,8 +1,14 @@
 """Which face to animate: a mood face matching one of her active emotions,
 else the uploaded face, else the persona's avatar (the one named in settings,
 or with none named, the persona of the chat she speaks in). Shared by hooks
-and routes. Also where her models live (models_dir)."""
+and routes. Also where her models live (models_dir), and how to reach her
+FlashHead server: this computer's, or with `client` on, the worker on another
+computer named by the pairing string in `worker` (core/worker_door.py)."""
+import json
 import re
+from pathlib import Path
+
+import requests
 
 from core.paths import PROJECT_ROOT
 
@@ -24,8 +30,72 @@ def settings():
 HEADERS = {"X-FlashHead": "1"}       # the service takes writes only with this (server.py _ours)
 
 
+def worker(s=None):
+    """The pairing string of the FlashHead this Sapphire uses on another
+    computer, else '' (this computer's own service)."""
+    s = s or settings()
+    return str(s.get("worker") or "").strip() if s.get("client") is True else ""
+
+
 def base_url(s=None):
+    w = worker(s)
+    if w:
+        from core import worker_door
+        return worker_door.parse(w)[0]
     return f"http://127.0.0.1:{int((s or settings()).get('port') or 5017)}"
+
+
+_http = {}
+
+
+def http(s=None):
+    """A requests session to her FlashHead server: this computer's (plain, our
+    header) or the worker's (pinned TLS, its key). Raises if the worker is
+    unreachable or no longer the one paired."""
+    w = worker(s)
+    sess = _http.get(w)
+    if sess is None:
+        if w:
+            from core import worker_door
+            sess, _ = worker_door.session(w, timeout=2)
+        else:
+            sess = requests.Session()
+            sess.trust_env = False
+            sess.headers.update(HEADERS)
+        _http[w] = sess
+    return sess
+
+
+def forget(s=None):
+    """A call failed: the next one connects afresh (and re-checks a worker's cert)."""
+    w = worker(s)
+    _http.pop(w, None)
+    if w:
+        from core import worker_door
+        base, _, fp = worker_door.parse(w)
+        worker_door.forget(base, fp)
+
+
+def httpx_kwargs(s=None):
+    """The same for an httpx client (the routes)."""
+    w = worker(s)
+    if not w:
+        return {"headers": HEADERS}
+    from core import worker_door
+    base, key, fp = worker_door.parse(w)
+    return {"verify": worker_door.context(base, fp, 2), "trust_env": False,
+            "headers": {"Authorization": f"Bearer {key}"}}
+
+
+def face_body(path, s=None):
+    """(url, body, headers) that show this face: its path to this computer's
+    server, the image itself to a worker elsewhere. Asks for her idle mode too."""
+    s = s or settings()
+    url = f"/face?idle={s.get('idle') or 'loop'}"
+    if worker(s):
+        kind = Path(path).suffix.lower().lstrip(".").replace("jpg", "jpeg") or "png"
+        return url, Path(path).read_bytes(), {"Content-Type": f"image/{kind}"}
+    return url, json.dumps({"path": str(path)}).encode(), {"Content-Type": "application/json"}
 
 
 def models_dir(s=None):
@@ -33,7 +103,6 @@ def models_dir(s=None):
     the same way from the settings it starts with. The default sits under
     user/models/, which core's backup never takes (rebuildable by contract);
     her faces and moods stay in user/flashhead/ and are backed up."""
-    from pathlib import Path
     raw = str((s or settings()).get("models_dir") or "").strip()
     if not raw:
         return PROJECT_ROOT / "user" / "models" / "flashhead"

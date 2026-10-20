@@ -100,7 +100,18 @@ function mountFaces(el) {
     refresh();
 }
 
-// Advanced: where her models live, so they can be backed up or moved.
+// Advanced: where her models live (to back up or move), and with sharing on,
+// which computers may use this GPU (core's worker-door panel).
+async function mountAdvanced(el, share) {
+    await mountModels(el);
+    if (!share) return;
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:14px;';
+    el.appendChild(box);
+    const { mountWorkerDoor } = await import('/static/shared/worker-door.js');
+    mountWorkerDoor(box, 'flashhead', { title: 'Computers that may use this GPU' });
+}
+
 async function mountModels(el) {
     el.innerHTML = `<div style="margin-top:6px;">
         <div style="font-weight:600;margin-bottom:4px;">Where her models live now</div>
@@ -114,7 +125,7 @@ async function mountModels(el) {
     } catch { el.querySelector('.fh-folder').textContent = 'unknown'; }
 }
 
-const RESTARTS = ['port', 'models_dir', 'install_test'];      // read once at service start: a change restarts it
+const RESTARTS = ['port', 'models_dir', 'install_test', 'share', 'share_port'];      // read once at service start: a change restarts it
 
 export default {
     name: 'flashhead',
@@ -133,7 +144,7 @@ export default {
             },
             render: (container, settings) =>
                 renderSettingsForm(container, fields, settings,
-                    { slots: [{ tab: 'Faces', mount: mountFaces }, { tab: 'Advanced', mount: mountModels }] }),
+                    { slots: [{ tab: 'Faces', mount: mountFaces }, { tab: 'Advanced', mount: el => mountAdvanced(el, saved.share === true) }] }),
             async save(s) {
                 const out = await pluginsAPI.saveSettings('flashhead', s);
                 const restart = RESTARTS.some(k => String(s[k] ?? '') !== String(saved[k] ?? ''));

@@ -9,9 +9,11 @@ A loader: this plugin ships only its own code. The engine and the weights are fe
 - **NVIDIA GPU, compute 8.0+** with **~7 GB of free VRAM** and a **driver 570 or newer** (CUDA 12.8). Tested on an RTX 5090 (4x real time); slower cards may not keep up live, and the panel says so after warm-up. CPU, AMD (ROCm) and macOS are not supported.
 - **~13 GB of disk**: the conda env (~5 GB) and the models (~7.7 GB).
 - **Streaming TTS** (Kokoro or Piper).
-- **Sapphire 2.15.1 or newer** (`min_core_version`).
+- **Sapphire 2.15.3 or newer** (`min_core_version`).
 - **conda**, as Sapphire's own install has: Sapphire builds this plugin's env itself when you enable it, after asking.
 - **Linux and Windows** (`platforms`). Linux: tested. Windows: untested; the env adds `triton-windows` for `torch.compile`, and without Triton it runs uncompiled (slower). On Windows keep Sapphire in a short folder path (or enable long paths): the download's work files sit deep.
+
+A Sapphire with no GPU can use one on another computer: see **One GPU, several Sapphires** below. It needs none of the above but Sapphire itself.
 
 The GPU is checked when the service starts, before the models download. The env itself is built before that check can run, so on a machine without a suitable GPU the ~5 GB env is still downloaded once.
 
@@ -27,6 +29,19 @@ Logs: `user/logs/flashhead-server.log`.
 **Testing without a GPU** (a VM): Settings › FlashHead › Advanced › *Test the install without a GPU*. It fetches and imports everything, never renders, and reports in the panel whether every step worked.
 
 **Uninstall** removes the plugin's code. What it fetched stays until you remove it: the env (`conda env remove -n sapphire-plugin-flashhead`), `user/models/flashhead/` (the models), and `user/flashhead/` (your uploaded faces and moods).
+
+## One GPU, several Sapphires
+
+One computer's FlashHead can give every Sapphire on your network her own live face: each is its own session (her face, her motion, her viewers), on one model.
+
+1. **On the computer with the GPU**: Settings › FlashHead › Advanced › *Share this GPU with other computers*, save. Under *Computers that may use this GPU*, add one by name: it shows a pairing string once.
+2. **On the other Sapphire**: enable FlashHead and choose **Client only** (or turn it on in Settings › FlashHead › Advanced). Paste the pairing string into *The other computer's FlashHead*, save.
+
+**No Sapphire on the GPU computer?** Copy this folder there and run `./flashhead-server.sh` (Linux) or `flashhead-server.bat` (Windows, from an Anaconda Prompt, in a short folder path). It builds its own conda env (`flashhead-server`, the packages `plugin.json` lists), keeps everything in `./user/` beside it, and serves only the shared door. `add <name>` prints a computer's pairing string, `remove <name>` shuts it out, `list` shows who is let in. `PORT` changes the door's port; `FLASHHEAD_ENV` uses an env you already have.
+
+**Check a server from any computer** (after `flashhead-server` has made its env there): `./flashhead-test.sh "<pairing string>" [face image]` or `flashhead-test.bat` (it asks for the string). It checks the certificate against the pin, that a wrong key is refused, the server's health, and if it can render, her idle and a few seconds of sound mouthed back, saving one frame to `user/test-frame.jpg`. On a computer with no NVIDIA GPU the first three pass and it says why it can't render.
+
+The other computer's port (5018 by default) must be reachable on your network. Traffic is TLS, pinned to that computer's own certificate (no certificate authority, so a changed address still works and a different server never does), with a key per computer; removing a computer shuts it out. Her voice goes there and comes back with her face, which is what keeps her lips in time. Her words always go first: when two talk at the same moment, both keep up on a fast card; on a slower one (a 5060 Ti) the second plays her voice without a face until the first is done.
 
 ## How it flows
 
@@ -44,7 +59,7 @@ her streamed voice ─tts_chunk_audio─► server.py (own conda env, GPU)
 - **Her screens** (setting): Sapphire ESP32 satellites with a screen (the Waveshare board on satellite firmware 0.7.7+) show her face while she talks, or always. A board stays a speaker first.
 - **Moods**: `user/flashhead/moods/<emotion>.png`, matched to her active emotion pieces at the start of each reply. Add them with **+ Mood** on the Faces tab.
 - **Stop** flushes the face with her voice.
-- The service listens on 127.0.0.1 only, answers Sapphire's own calls only, and animates faces only from inside Sapphire's folder.
+- The service listens on 127.0.0.1, answers Sapphire's own calls only, and animates faces only from inside Sapphire's folder. With sharing on it also opens the TLS door above; nothing comes in through it without a key. Faces other computers send are kept in `user/models/flashhead/faces/` (copies, never backed up).
 
 ## What gets fetched, and their licenses
 

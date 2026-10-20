@@ -1,8 +1,8 @@
 {
   "name": "flashhead",
   "short_display_name": "FlashHead",
-  "version": "0.6.0",
-  "min_core_version": "2.15.1",
+  "version": "0.7.0",
+  "min_core_version": "2.15.3",
   "description": "Live talking face — SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
   "author": "sapphire",
   "icon": "🗣️",
@@ -33,8 +33,14 @@
       "pyyaml",
       "pillow",
       "av",
-      "huggingface_hub"
-    ]
+      "huggingface_hub",
+      "cryptography"
+    ],
+    "client": {
+      "setting": "client",
+      "label": "Client only",
+      "help": "use a FlashHead server on another computer; nothing downloads here"
+    }
   },
   "capabilities": {
     "services": [
@@ -156,6 +162,42 @@
         "default": "",
         "help": "Empty: the avatar of the persona in the chat she speaks in, so the face follows whoever is talking. A persona's name pins that one. An uploaded face (Faces tab) wins over both.",
         "placeholder": "follow the chat"
+      },
+      {
+        "key": "client",
+        "type": "boolean",
+        "label": "Client only",
+        "default": false,
+        "tab": "Advanced",
+        "help": "Use a FlashHead server on another computer instead of this one: no environment, no models, no GPU here. Saving starts or stops this computer's server."
+      },
+      {
+        "key": "worker",
+        "type": "string",
+        "label": "The other computer's FlashHead",
+        "default": "",
+        "tab": "Advanced",
+        "show_if": {"client": true},
+        "placeholder": "https://192.168.0.10:5018/#key=...&pin=...",
+        "help": "Its pairing string: on that computer, Settings > FlashHead > Advanced, turn on Share this GPU, then Add a computer (or flashhead-server's add command). Her face here is sent there; her words go there and come back with her face."
+      },
+      {
+        "key": "share",
+        "show_if": {"client": false},
+        "type": "boolean",
+        "label": "Share this GPU with other computers",
+        "default": false,
+        "tab": "Advanced",
+        "help": "Other Sapphires on your network use this computer's FlashHead, each with her own face, through an encrypted door with a key per computer (add them below). One GPU: her words always go first, and two talking at the same moment need a fast card (one at a time keeps up on a 5060 Ti). Saving restarts the service."
+      },
+      {
+        "key": "share_port",
+        "show_if": {"client": false},
+        "type": "number",
+        "label": "Share port",
+        "default": 5018,
+        "tab": "Advanced",
+        "help": "Port of the encrypted door other computers come in through. Saving restarts the service."
       },
       {
         "key": "port",

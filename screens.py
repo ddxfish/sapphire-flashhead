@@ -12,8 +12,6 @@ import logging
 import threading
 import time
 
-import requests
-
 from plugins.flashhead import faces
 
 logger = logging.getLogger(__name__)
@@ -25,6 +23,7 @@ AHEAD_S = 0.15                  # the browser starts a packet's sound this far a
 _stop = threading.Event()
 _wake = threading.Event()
 _connected = threading.Event()
+_again = threading.Event()      # the server moved (client mode, a new worker): reconnect
 _thread = None
 
 
@@ -37,6 +36,12 @@ def start(plugin_loader, settings):
 
 def stop():
     _stop.set()
+    _wake.set()
+
+
+def on_settings_saved(settings):
+    """Core calls this on a save: a stream to where the server was is dropped."""
+    _again.set()
     _wake.set()
 
 
@@ -113,6 +118,7 @@ def _run():
             _watch(boards, mode)
         except Exception as e:
             logger.warning(f"[flashhead] screens stream ended: {e}")
+            faces.forget()
             time.sleep(2)
 
 
@@ -122,7 +128,7 @@ def _watch(boards, mode):
     pushers = [_Pusher(b) for b in boards]
     last_word, checked = time.monotonic(), time.monotonic()
     try:
-        with requests.get(f"{faces.base_url()}/stream?audio=0", stream=True, timeout=(5, 30)) as r:
+        with faces.http().get(f"{faces.base_url()}/stream?audio=0", stream=True, timeout=(5, 30)) as r:
             _connected.set()
             raw = r.raw
 
@@ -136,7 +142,8 @@ def _watch(boards, mode):
                 return b
 
             logger.info(f"[flashhead] her face on {', '.join(b[0] for b in boards)} ({mode})")
-            while not _stop.is_set():
+            _again.clear()
+            while not _stop.is_set() and not _again.is_set():
                 now = time.monotonic()
                 if mode == "talking" and now - last_word > HOLD_S and not _wake.is_set():
                     return

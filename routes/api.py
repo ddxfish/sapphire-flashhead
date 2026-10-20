@@ -15,10 +15,13 @@ MAX_FACE = 8 * 1024 * 1024
 async def status(settings=None, **_):
     out = {}
     try:
-        async with httpx.AsyncClient(timeout=2) as c:
+        kw = await asyncio.to_thread(faces.httpx_kwargs, settings)
+        async with httpx.AsyncClient(timeout=2, **kw) as c:
             out.update((await c.get(f"{faces.base_url(settings)}/health")).json())
-    except Exception:
-        out.update(status="offline", error="Service not running — build the env or toggle the plugin")
+    except Exception as e:
+        out.update(status="offline", error=(f"The FlashHead on the other computer is not answering: {type(e).__name__}"
+                                            if faces.worker(settings) else
+                                            "Service not running — build the env or toggle the plugin"))
     path, mood = faces.current(settings)
     source = None if not path else "upload" if path == faces.FACE else "mood" if mood else "avatar"
     out.update(face_source=source, mood=mood, moods=faces.moods(),
@@ -32,10 +35,14 @@ async def stream(settings=None, **_):
     from fastapi.responses import JSONResponse, StreamingResponse
     base = faces.base_url(settings)
     path, _ = faces.current(settings)
-    client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=30), headers=faces.HEADERS)
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=30), **await asyncio.to_thread(faces.httpx_kwargs, settings))
+    except Exception as e:
+        return JSONResponse({"error": f"FlashHead service unreachable: {e}"}, status_code=503)
     try:
         if path:
-            await client.post(f"{base}/face", json={"path": str(path)})
+            url, body, headers = faces.face_body(path, settings)
+            await client.post(f"{base}{url}", content=body, headers=headers)
         resp = await client.send(client.build_request("GET", f"{base}/stream"), stream=True)
     except Exception as e:
         await client.aclose()
@@ -87,8 +94,9 @@ async def _show_now(settings):
     if not path:
         return
     try:
-        async with httpx.AsyncClient(timeout=2, headers=faces.HEADERS) as c:
-            await c.post(f"{faces.base_url(settings)}/face", json={"path": str(path)})
+        url, body, headers = faces.face_body(path, settings)
+        async with httpx.AsyncClient(timeout=3, **await asyncio.to_thread(faces.httpx_kwargs, settings)) as c:
+            await c.post(f"{faces.base_url(settings)}{url}", content=body, headers=headers)
     except Exception:
         pass                                    # not running: it is picked up when a viewer opens the stream
 
