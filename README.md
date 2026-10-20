@@ -1,17 +1,19 @@
-# FlashHead
+# FlashHead Sapphire Plugin
 
-Her persona avatar, lip-synced live to her voice by SoulX-FlashHead Lite on your GPU, in the chat sidebar, a full page, and on her boards' screens.
+by [Teri](https://github.com/MovLab2) and [Chris](https://github.com/ddxfish)
+
+This is a plugin for [Sapphire AI](https://github.com/ddxfish/sapphire) that gives a personal avatar from any avatar image you want, lip-synced live to her voice by SoulX-FlashHead Lite on your GPU, in the chat sidebar.
 
 A loader: this plugin ships only its own code. The engine and the weights are fetched on first start (below).
 
 ## Requirements
 
-- **NVIDIA GPU, compute 8.0+** with **~7 GB of free VRAM** and a **driver 570 or newer** (CUDA 12.8). Tested on an RTX 5090 (4x real time, compiled). An RTX 5060 Ti renders about 1.2x compiled, so it keeps up with little to spare; slower cards may not keep up live, and the panel says so after warm-up. CPU, AMD (ROCm) and macOS are not supported.
+- **NVIDIA GPU, compute 8.0+** with **~7 GB of free VRAM** and a **driver 570 or newer** (CUDA 12.8). Tested on an RTX 5090 (5x real time, compiled). An RTX 5060 Ti renders about 1.2x compiled, so it keeps up with little to spare; slower cards may not keep up live, and the panel says so after warm-up. CPU, AMD (ROCm) and macOS are not supported.
 - **~13 GB of disk**: the conda env (~5 GB) and the models (~7.7 GB).
 - **Streaming TTS** (Kokoro or Piper).
 - **Sapphire 2.15.3 or newer** (`min_core_version`).
 - **conda**, as Sapphire's own install has: Sapphire builds this plugin's env itself when you enable it, after asking.
-- **Linux and Windows** (`platforms`). Linux: tested. Windows: runs on a 5060 Ti; the env adds `triton-windows` for `torch.compile` (about 20% faster than without). If compiling can't start it loads uncompiled and says so in its log. Don't set `TORCH_COMPILE_DISABLE` or `TORCHDYNAMO_DISABLE`: they turn compiling off for good. On Windows keep Sapphire in a short folder path (or enable long paths): the download's work files sit deep.
+- **Linux and Windows** (`platforms`). Linux: tested. Windows: tested on a 5060 Ti; the env adds `triton-windows` for `torch.compile` (about 20% faster than without). If compiling can't start it loads uncompiled and says so in its log. Don't set `TORCH_COMPILE_DISABLE` or `TORCHDYNAMO_DISABLE`: they turn compiling off for good. On Windows keep Sapphire in a short folder path (or enable long paths): the download's work files sit deep.
 
 A Sapphire with no GPU can use one on another computer: see **One GPU, several Sapphires** below. It needs none of the above but Sapphire itself.
 
@@ -35,7 +37,7 @@ Logs: `user/logs/flashhead-server.log`.
 One computer's FlashHead can give every Sapphire on your network her own live face: each is its own session (her face, her motion, her viewers), on one model.
 
 1. **On the computer with the GPU**: Settings › FlashHead › Advanced › *Share this GPU with other computers*, save. Under *Computers that may use this GPU*, add one by name: it shows a pairing string once.
-2. **On the other Sapphire**: enable FlashHead and choose **Client only** (or turn it on in Settings › FlashHead › Advanced). Paste the pairing string into *The other computer's FlashHead*, save.
+2. **On the other Sapphire**: enable FlashHead and choose **Client only** (or turn it on in Settings › FlashHead › Advanced). Paste the pairing string into *Pairing string from the GPU computer*, save.
 
 **No Sapphire on the GPU computer?** Copy this folder there and run `./flashhead-server.sh` (Linux) or `flashhead-server.bat` (Windows, from an Anaconda Prompt, in a short folder path). It builds its own conda env (`flashhead-server`, the packages `plugin.json` lists), keeps everything in `./user/` beside it (inside a Sapphire install: that Sapphire's `user/`, the plugin's own folders, so nothing downloads twice), and serves only the shared door. `add <name>` prints a computer's pairing string, `remove <name>` shuts it out, `list` shows who is let in. `PORT` changes the door's port; `FLASHHEAD_ENV` uses an env you already have.
 
