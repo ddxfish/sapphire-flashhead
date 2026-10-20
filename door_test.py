@@ -9,7 +9,7 @@ flashhead-server made. Steps, each said as it passes or fails:
   2. a wrong key is refused
   3. health: ready, or why it can't render on that computer
   4. if ready: a face (yours, or a test card), her idle, then a few seconds
-     of sound mouthed back with frames; one frame saved to user/test-frame.jpg
+     of sound mouthed back with frames; one frame saved to the temp folder
 Exit 0 when everything that computer can do worked.
 """
 import io
@@ -17,6 +17,7 @@ import json
 import math
 import struct
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -127,8 +128,7 @@ def main(argv):
     ok = say(got["speech"] >= 4, f"4 s of sound came back mouthed: {got['speech']} chunks, "
                                  f"{got['sound']:.1f} s of audio, in {time.time() - t0:.1f} s")
     if frame:
-        out = Path("user") / "test-frame.jpg"
-        out.parent.mkdir(exist_ok=True)
+        out = Path(tempfile.gettempdir()) / "flashhead-test-frame.jpg"   # never inside the plugin's folder
         out.write_bytes(frame["jpeg"])
         print(f"  one frame of it: {out.resolve()}")
     print("\nEverything works." if ok else "\nRendering did not keep up: see the server's window.")

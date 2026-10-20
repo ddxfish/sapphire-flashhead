@@ -90,6 +90,22 @@ def httpx_kwargs(s=None):
             "headers": {"Authorization": f"Bearer {key}"}}
 
 
+def unreachable(e):
+    """Why the worker on the other computer can't be reached, in words. The
+    door's own errors name the worker's address only, never its key."""
+    import ssl
+    text = next((a for a in getattr(e, "args", ()) if isinstance(a, str)), str(e))   # ssl.SSLError keeps its words in args
+    if "pairing names" in text:                     # worker_door: the pin doesn't match
+        return text
+    if isinstance(e, ssl.SSLError) or "SSL" in type(e).__name__ or "CERTIFICATE" in text:
+        return f"TLS failed ({text or type(e).__name__}): is that the worker's door, and the pairing string its newest?"
+    if isinstance(e, ConnectionRefusedError) or "refused" in text.lower():
+        return "nothing answers at that address: it's off, the port is wrong, or sharing is off on that computer"
+    if isinstance(e, TimeoutError) or "timed out" in text.lower() or "Timeout" in type(e).__name__:
+        return "no answer in time: a firewall on that computer, or the wrong address"
+    return type(e).__name__
+
+
 def face_body(path, s=None):
     """(url, body, headers) that show this face: its path to this computer's
     server, the image itself to a worker elsewhere. Asks for her idle mode too."""

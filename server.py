@@ -95,6 +95,7 @@ _watching = threading.Event()    # anyone, in any session
 _pipe = None
 P = {}                   # chunk geometry, filled after the model loads
 IDLE_CHUNKS, IDLE_SETTLE, IDLE_KEEP = 14, 3, 5   # loop mode: render 14 silent chunks, skip the 3 that settle, keep the calmest 5
+HOME = 0.25              # live idle: how much of her picture goes back into the motion she continues from, each quiet chunk
 SETTINGS = ROOT / "user" / "webui" / "plugins" / "flashhead.json"
 FACES = ROOT / "user" / "models" / "flashhead" / "faces"     # faces other computers sent: copies, rebuildable
 DOOR = ROOT / "user" / "worker_door" / "flashhead"           # its cert and the keys of the computers let in
@@ -408,6 +409,18 @@ def _reset_motion(s):
         s.dq = np.zeros(P["cache"], np.float32)
 
 
+def _home(s):
+    """Silence feeds on itself: each chunk goes on from the last, and with no
+    words to steer her, her lips run to lipstick and her eyes soften within a
+    minute. A quarter of her picture mixed into the motion she goes on from
+    holds her (measured: lip colour +4% on average instead of +25%, peak
+    +8% instead of +50%; she still blinks and shifts). Speech doesn't drift
+    and a pull there dulls her mouth, so it's for quiet chunks only."""
+    with _gpu:
+        a, ref, m = s.t
+        s.t = (a, ref, ((1 - HOME) * m.float() + HOME * ref[:, :m.shape[1]].float()).to(m.dtype))
+
+
 def _idle_mode(s):
     """'loop' (rendered once, the GPU rests) or 'live' (rendered as she sits,
     the GPU works while anyone watches): as her Sapphire asked, else this
@@ -655,6 +668,7 @@ def _turn():
         pkt = None
         if kind == "idle" and _idle_mode(s) == "live":
             frames = _render(s, a16)            # she sits as the model has her; her next words go on from here
+            _home(s)
             s.live, s.build = True, None
         elif kind == "idle":
             frames, pkt = _idle_step(s)

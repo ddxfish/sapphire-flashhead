@@ -19,7 +19,7 @@ async def status(settings=None, **_):
         async with httpx.AsyncClient(timeout=2, **kw) as c:
             out.update((await c.get(f"{faces.base_url(settings)}/health")).json())
     except Exception as e:
-        out.update(status="offline", error=(f"The FlashHead on the other computer is not answering: {type(e).__name__}"
+        out.update(status="offline", error=(f"The FlashHead on the other computer is not answering: {faces.unreachable(e)}"
                                             if faces.worker(settings) else
                                             "Service not running — build the env or toggle the plugin"))
     path, mood = faces.current(settings)

@@ -3,6 +3,9 @@
 # Other computers' Sapphires use it in Client only mode (README: One GPU,
 # several Sapphires). Everything it keeps lands in ./user/ beside this file:
 # the models (~8 GB), its certificate and the keys of the computers let in.
+# Inside a Sapphire install (user/plugins/flashhead) it uses that Sapphire's
+# user/ instead, the same folders as the plugin: never files in the plugin's
+# own folder, which its signature would refuse.
 #
 #   ./flashhead-server.sh               run it (builds its conda env the first time, ~5 GB)
 #   ./flashhead-server.sh add <name>    let a computer in: prints its pairing string
@@ -15,7 +18,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ENV=${FLASHHEAD_ENV:-flashhead-server}     # FLASHHEAD_ENV: use an env you already have
 PORT=${PORT:-5018}
-DOOR=user/worker_door/flashhead
+ROOT="$PWD"
+[ -f ../../../sapphire.py ] && ROOT="$(cd ../../.. && pwd)"
+DOOR="$ROOT/user/worker_door/flashhead"
 
 command -v conda >/dev/null || { echo "conda not found: install Miniconda, then run this again"; exit 1; }
 eval "$(conda shell.bash hook)"
@@ -28,15 +33,16 @@ conda activate "$ENV"
 
 # The packages are the ones plugin.json lists, read from it: one list, never two.
 # What was installed is noted inside the env, so a remade env installs again.
-mkdir -p user
+mkdir -p "$ROOT/user"
 STAMP="$CONDA_PREFIX/flashhead-requirements.txt"
-python -c "import json; print('\n'.join(json.load(open('plugin.json', encoding='utf-8'))['environment']['pip']))" > user/requirements.new
-if ! cmp -s user/requirements.new "$STAMP"; then
+NEW="$ROOT/user/flashhead-requirements.new"
+python -c "import json; print('\n'.join(json.load(open('plugin.json', encoding='utf-8'))['environment']['pip']))" > "$NEW"
+if ! cmp -s "$NEW" "$STAMP"; then
     echo "Installing packages (the first time downloads ~5 GB)..."
-    python -m pip install -r user/requirements.new
-    mv user/requirements.new "$STAMP"
+    python -m pip install -r "$NEW"
+    mv "$NEW" "$STAMP"
 else
-    rm user/requirements.new
+    rm "$NEW"
 fi
 
 case "${1:-run}" in
@@ -44,7 +50,7 @@ case "${1:-run}" in
     remove) python worker_door.py remove "$DOOR" "${2:?which name}" ;;
     list)   python worker_door.py list "$DOOR" ;;
     run)
-        export SAPPHIRE_ROOT="$PWD" SAPPHIRE_SERVICE_PORT=5017
+        export SAPPHIRE_ROOT="$ROOT" SAPPHIRE_SERVICE_PORT=5017
         IT=false; [ "${INSTALL_TEST:-}" = 1 ] && IT=true
         export SAPPHIRE_PLUGIN_SETTINGS="{\"share\": true, \"share_port\": $PORT, \"install_test\": $IT}"
         echo "FlashHead server: computers let in reach it on port $PORT (./flashhead-server.sh add <name>)"

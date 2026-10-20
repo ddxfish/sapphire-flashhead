@@ -174,7 +174,7 @@
       {
         "key": "worker",
         "type": "string",
-        "label": "The other computer's FlashHead",
+        "label": "Pairing string from the GPU computer",
         "default": "",
         "tab": "Advanced",
         "show_if": {"client": true},
