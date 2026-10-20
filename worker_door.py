@@ -1,3 +1,5 @@
+# Part of Sapphire core (AGPL-3.0). Copies carried inside plugins are offered
+# under the MIT license by the same author, Sapphire Blue AI LLC.
 """The worker door: a worker (Kokoro, a FlashHead GPU) shared on the network, safely.
 
 One file, stdlib + `cryptography` (server half) + `requests` (client
@@ -24,6 +26,7 @@ CLI (for a worker with no Sapphire around it):
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -31,11 +34,14 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 _NAME = re.compile(r"[^a-z0-9_-]")
+DEVICES = {"con", "prn", "aux", "nul", *(f"{d}{i}" for d in ("com", "lpt") for i in range(1, 10))}   # Windows: never a file name
+logger = logging.getLogger("worker_door")
 
 
 # ── server half ──────────────────────────────────────────────────────────
@@ -77,7 +83,7 @@ def _fingerprint(pem):
 def _write_private(path, data):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
@@ -108,7 +114,8 @@ def clients(folder):
 
 
 def slug(name):
-    return _NAME.sub("", str(name or "").strip().lower().replace(" ", "-"))[:32]
+    s = _NAME.sub("", str(name or "").strip().lower().replace(" ", "-"))[:32]
+    return s + "-" if s in DEVICES else s
 
 
 def add_client(folder, name):
@@ -127,6 +134,54 @@ def remove_client(folder, name):
     data = clients(folder)
     if data.pop(slug(name), None) is not None:
         _write_private(Path(folder) / "clients.json", json.dumps(data, indent=2).encode("utf-8"))
+    gone = seen(folder)
+    if gone.pop(slug(name), None) is not None:
+        _write_private(Path(folder) / "seen.json", json.dumps(gone).encode("utf-8"))
+
+
+def admit(handler):
+    """The client a request through the door belongs to, else None (and the
+    refusal is the caller's to answer). Says so in the log and in
+    <folder>/seen.json, who and from where, never what: a computer's first
+    call, and a refused key at most once a minute per address. The panel
+    reads seen.json for "last seen"."""
+    folder, ip = handler.server.door, handler.client_address[0]
+    name = client_of(folder, handler.headers.get("Authorization"))
+    now = time.time()
+    with _lock:
+        last = _seen.get((name, ip), 0)
+        _seen[(name, ip)] = now
+    if name is None and now - last > 60:
+        logger.warning(f"Refused a key from {ip}: not one of this computer's (removed, or an old pairing string)")
+    elif name and not last:
+        logger.info(f"{name} came in from {ip}")
+    if name and now - last > 60:
+        _write_seen(folder, name, ip, now)
+    return name
+
+
+_seen = {}                  # (client or None, ip) -> last time
+
+
+def _write_seen(folder, name, ip, now):
+    path = Path(folder) / "seen.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data[name] = {"at": int(now), "from": ip}
+    try:
+        _write_private(path, json.dumps(data).encode("utf-8"))
+    except OSError:
+        pass
+
+
+def seen(folder):
+    """{name: {"at": unix time, "from": ip}} of each client's last call (to the minute)."""
+    try:
+        return json.loads((Path(folder) / "seen.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def client_of(folder, authorization):
@@ -172,14 +227,22 @@ def serve(server_cls, handler, host, port, folder):
 
     class Door(server_cls):
         door = Path(folder)
+        allow_reuse_address = sys.platform != "win32"     # Windows lets a second server share a taken port, silently
 
         def finish_request(self, request, client_address):
             request.settimeout(10)
             try:
                 tls = ctx.wrap_socket(request, server_side=True)
-            except (ssl.SSLError, OSError):
-                return                                      # not TLS, or gave up: nothing to answer
-            tls.settimeout(None)
+            except (ssl.SSLError, OSError) as e:          # not TLS, or gave up: nothing to answer
+                now, ip = time.time(), client_address[0]
+                with _lock:
+                    last = _seen.get(("tls", ip), 0)
+                    _seen[("tls", ip)] = now
+                if now - last > 60:
+                    logger.warning(f"A connection from {ip} failed before its key ({type(e).__name__}): "
+                                   "plain http, or a client that doesn't trust this cert")
+                return
+            tls.settimeout(60)        # a caller that stops reading or never sends its request lets go of the thread
             self.RequestHandlerClass(tls, client_address, self)
 
         def handle_error(self, request, client_address):
@@ -260,7 +323,12 @@ def _main(argv):
     elif len(argv) == 4 and argv[1] == "remove":
         remove_client(argv[2], argv[3])
     elif len(argv) == 3 and argv[1] == "list":
-        print("\n".join(clients(argv[2])) or "(no clients)")
+        last = seen(argv[2])
+        for name in clients(argv[2]):
+            s = last.get(name)
+            print(f"{name}: " + (f"last seen {time.strftime('%Y-%m-%d %H:%M', time.localtime(s['at']))} from {s['from']}"
+                                 if s else "never seen"))
+        print("" if clients(argv[2]) else "(no clients)")
     else:
         print(__doc__.split("CLI", 1)[1])
         return 2

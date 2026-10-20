@@ -10,6 +10,7 @@
 #   ./flashhead-server.sh list          who is let in
 #
 # PORT (5018) is the door other computers use; open it in your firewall.
+# No NVIDIA GPU here? INSTALL_TEST=1 fetches and imports everything, then says it can't render.
 set -euo pipefail
 cd "$(dirname "$0")"
 ENV=${FLASHHEAD_ENV:-flashhead-server}     # FLASHHEAD_ENV: use an env you already have
@@ -26,12 +27,14 @@ fi
 conda activate "$ENV"
 
 # The packages are the ones plugin.json lists, read from it: one list, never two.
+# What was installed is noted inside the env, so a remade env installs again.
 mkdir -p user
-python -c "import json; print('\n'.join(json.load(open('plugin.json'))['environment']['pip']))" > user/requirements.new
-if ! cmp -s user/requirements.new user/requirements.txt; then
+STAMP="$CONDA_PREFIX/flashhead-requirements.txt"
+python -c "import json; print('\n'.join(json.load(open('plugin.json', encoding='utf-8'))['environment']['pip']))" > user/requirements.new
+if ! cmp -s user/requirements.new "$STAMP"; then
     echo "Installing packages (the first time downloads ~5 GB)..."
     python -m pip install -r user/requirements.new
-    mv user/requirements.new user/requirements.txt
+    mv user/requirements.new "$STAMP"
 else
     rm user/requirements.new
 fi
@@ -42,7 +45,8 @@ case "${1:-run}" in
     list)   python worker_door.py list "$DOOR" ;;
     run)
         export SAPPHIRE_ROOT="$PWD" SAPPHIRE_SERVICE_PORT=5017
-        export SAPPHIRE_PLUGIN_SETTINGS="{\"share\": true, \"share_port\": $PORT}"
+        IT=false; [ "${INSTALL_TEST:-}" = 1 ] && IT=true
+        export SAPPHIRE_PLUGIN_SETTINGS="{\"share\": true, \"share_port\": $PORT, \"install_test\": $IT}"
         echo "FlashHead server: computers let in reach it on port $PORT (./flashhead-server.sh add <name>)"
         exec python server.py ;;
     *) sed -n '2,13p' "$0"; exit 2 ;;

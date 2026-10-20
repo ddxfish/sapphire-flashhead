@@ -34,7 +34,7 @@ function createPlayer(canvas) {
     }
 
     function schedule(head, bytes, off) {
-        const dur = head.frames.length / head.fps;
+        const dur = head.frames.length ? head.frames.length / head.fps : head.audio / 2 / head.sr;   // her voice without a face still takes its time
         const t = Math.max(next, ctx.currentTime + 0.15);
         next = t + dur;
         if (head.audio) {

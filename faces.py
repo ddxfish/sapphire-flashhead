@@ -10,7 +10,9 @@ from pathlib import Path
 
 import requests
 
+from core import worker_door
 from core.paths import PROJECT_ROOT
+from plugins.flashhead.worker_door import DEVICES     # its own copy: core 2.15.3 has no such list
 
 DIR = PROJECT_ROOT / "user" / "flashhead"
 FACE = DIR / "face.png"
@@ -19,7 +21,8 @@ _SLUG = re.compile(r"[^a-z0-9_-]")
 
 
 def slug(name):
-    return _SLUG.sub("", (name or "").strip().lower().replace(" ", "_"))[:40]
+    s = _SLUG.sub("", (name or "").strip().lower().replace(" ", "_"))[:40]
+    return s + "_" if s in DEVICES else s
 
 
 def settings():
@@ -103,7 +106,7 @@ def models_dir(s=None):
     the same way from the settings it starts with. The default sits under
     user/models/, which core's backup never takes (rebuildable by contract);
     her faces and moods stay in user/flashhead/ and are backed up."""
-    raw = str((s or settings()).get("models_dir") or "").strip()
+    raw = str((s or settings()).get("models_dir") or "").strip().strip('"')     # Explorer's "Copy as path" adds quotes
     if not raw:
         return PROJECT_ROOT / "user" / "models" / "flashhead"
     p = Path(raw).expanduser()

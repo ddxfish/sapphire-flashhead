@@ -49,7 +49,8 @@ import numpy as np
 
 import worker_door                  # a copy of Sapphire's core/worker_door.py: this server also runs alone
 
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "2")   # not 32 idle compiler workers per service
+if sys.platform != "win32":     # Windows picks 1 itself; more needs a subprocess pool it can't start (pass_fds)
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "2")   # not 32 idle compiler workers per service
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
@@ -65,7 +66,7 @@ _START = json.loads(os.environ.get("SAPPHIRE_PLUGIN_SETTINGS") or "{}")
 def _models_dir():
     """Her models' folder: settings `models_dir` (the same rule as faces.models_dir),
     else user/models/flashhead: core's cache floor, never in a backup."""
-    raw = str(_START.get("models_dir") or "").strip()
+    raw = str(_START.get("models_dir") or "").strip().strip('"')     # Explorer's "Copy as path" adds quotes
     if not raw:
         return ROOT / "user" / "models" / "flashhead"
     p = Path(raw).expanduser()
@@ -73,18 +74,22 @@ def _models_dir():
 
 
 MODELS = _models_dir()
+for _var, _sub in (("TORCHINDUCTOR_CACHE_DIR", "inductor"), ("TRITON_CACHE_DIR", "triton")):
+    # compiled kernels beside the models, not under a profile folder (Windows: a long or non-ASCII user name breaks them)
+    os.environ.setdefault(_var, str(ROOT / "user" / "models" / "flashhead" / "cache" / _sub))
 ENGINE = ROOT / "user" / "models" / "flashhead" / "engine" / ENGINE_SHA[:12]   # fetched code: rebuildable, so cache floor too
 CKPT = MODELS / "SoulX-FlashHead-1_3B"
 W2V = MODELS / "wav2vec2-base-960h"
 PLAY_SR = 24000          # Kokoro's native rate; what the viewer hears
-LEAD = 0.5               # seconds rendered ahead of the wall clock
+LEAD = 0.5               # seconds rendered ahead of the wall clock (at least 1.5 renders: see _pick)
 VIEWER_QUEUE = 8
+BEAT = [0.0]             # when the render loop last came round: /speak takes no words from a stalled one
 
 _state = {"status": "starting", "error": None, "progress": None,
           "warning": None,      # ready, but the GPU is slower than real time
           "note": None}         # a few seconds of work under "ready"
 _gpu = threading.Lock()
-_sessions = {}           # name -> Session: each Sapphire using this worker, "local" being this computer's
+_sessions = {}           # (where, name) -> Session: ("local", "local") is this computer's Sapphire, ("door", name) the others
 _viewers_lock = threading.Lock()
 _watching = threading.Event()    # anyone, in any session
 _pipe = None
@@ -117,14 +122,19 @@ class Session:
         self.live = False           # her motion runs on from the last chunk; False: speech starts her afresh
         self.clock = None           # [t0, seconds made] while watched
         self.note = None
+        self.gen = 0                # bumped by a flush: a chunk rendered before it is never sent after it
+        self.build = None           # her calm loop being made, a chunk per turn
+        self.fails = 0              # renders failed in a row, this session's alone
 
     def talking(self):
         return not self.speech.empty() or len(self.pending["a16"]) > 0
 
 
-def _session(name):
+def _session(name, door=False):
+    """Door sessions are keyed apart from this computer's: no client name can ever be hers."""
+    key = ("door" if door else "local", name)
     with _viewers_lock:
-        return _sessions.get(name) or _sessions.setdefault(name, Session(name))
+        return _sessions.get(key) or _sessions.setdefault(key, Session(name))
 
 
 DONE = ".complete"       # written last: a folder without it is a fetch that did not finish
@@ -311,8 +321,20 @@ def _load():
             fp.COMPILE_MODEL = fp.COMPILE_VAE = False
         torch._dynamo.config.suppress_errors = True   # a compile that fails falls back to eager, not to a dead service
         torch.backends.cudnn.benchmark = True        # VAE 3-D convs: ~15% on the 5090
-        _pipe = fh.get_pipeline(world_size=1, ckpt_dir=str(CKPT), model_type="lite", wav2vec_dir=str(W2V))
+        load = lambda: fh.get_pipeline(world_size=1, ckpt_dir=str(CKPT), model_type="lite", wav2vec_dir=str(W2V))
+        _pipe = None
+        try:
+            _pipe = load()
+        except Exception as e:
+            if not fp.COMPILE_MODEL:
+                raise
+            logger.warning(f"torch.compile would not start ({type(e).__name__}: {e}): loading without it (slower)")
+            fp.COMPILE_MODEL = fp.COMPILE_VAE = False
+        if _pipe is None:                     # out here, the failed load's model is freed before the second
+            torch.cuda.empty_cache()
+            _pipe = load()
         ip = fh.get_infer_params()
+        # the model's window geometry, as in SoulX-FlashHead's generate_video.py stream mode (Apache-2.0)
         slice_len = ip["frame_num"] - ip["motion_frames_num"]
         cache = ip["sample_rate"] * ip["cached_audio_duration"]
         end = ip["cached_audio_duration"] * ip["tgt_fps"]
@@ -328,20 +350,38 @@ def _load():
         warm = Session("warm-up")
         warm.want = str(blank)
         _apply_face(warm)
-        _state["status"] = "warming up (torch.compile, ~1 min)"
+        _state["status"] = "warming up (torch.compile: a minute, several the first time)" if fp.COMPILE_MODEL else "warming up"
         _render(warm, np.zeros(P["n16"], np.float32))
         t = time.perf_counter()
         _render(warm, np.zeros(P["n16"], np.float32))          # compiled now: this one is the real speed
-        speed = P["chunk_s"] / (time.perf_counter() - t)
+        P["render_s"] = time.perf_counter() - t
+        speed = P["chunk_s"] / P["render_s"]
+        P["compiled"] = _compiled(fp)
         if speed < 1.1:
             _state["warning"] = (f"This GPU renders {speed:.1f}x real time: her face may fall behind her voice. "
-                                 "Other work on the GPU (a local LLM, a game) slows her too.")
+                                 "Other work on the GPU (a local LLM, a game) slows her too."
+                                 + {"no": " It runs without torch.compile (see its log), ~20% slower.",
+                                    "partly": " Parts of it run without torch.compile (see its log)."}.get(P["compiled"], ""))
             logger.warning(_state["warning"])
         _state["status"] = "ready"
-        logger.info(f"Ready: {P['n16']} samples -> {P['n16'] * P['fps'] // P['sr']} frames per chunk")
+        logger.info(f"Ready: {P['n16']} samples -> {P['n16'] * P['fps'] // P['sr']} frames per chunk, "
+                    f"{speed:.1f}x real time, torch.compile: {P['compiled']}")
     except Exception as e:
         logger.exception("Load failed")
         _state.update(status="error", error=str(e))
+
+
+def _compiled(fp):
+    """'yes', 'partly' or 'no': whether torch.compile really took. Its
+    failures are turned into plain eager runs (suppress_errors), so this
+    counts what compiled instead of trusting that it was asked to."""
+    if not fp.COMPILE_MODEL:
+        return "no"
+    from torch._dynamo.utils import counters
+    ok, total = counters["frames"]["ok"], counters["frames"]["total"]
+    if ok < total:
+        logger.warning(f"torch.compile failed for {total - ok} of {total} parts: those run uncompiled (the reason is above)")
+    return "yes" if ok == total else "partly" if ok else "no"
 
 
 def _apply_face(s):
@@ -395,19 +435,28 @@ def _drift(s, frames):
     return np.array([np.abs(small(Image.fromarray(f)) - ref).mean() for f in frames])
 
 
-def _idle_packets(s):
+def _idle_step(s):
     """Loop mode: calm idle for the session's face, rendered once. The stretch
     that stays closest to her face is kept and played forward then back, so
-    she never nods off and snaps awake at the turn. The GPU then rests."""
-    if s.idle["key"] != s.face:
+    she never nods off and snaps awake at the turn. The GPU then rests.
+    Made one chunk per turn of the render loop (shown as she sits meanwhile),
+    so anyone's words go in between. -> (frames to send, or a packet made)."""
+    if s.idle["key"] == s.face:
+        loop = s.idle["packets"]
+        s.idle["at"] += 1
+        return None, loop[(s.idle["at"] - 1) % len(loop)]
+    b = s.build
+    if b is None or b["face"] != s.face:
         s.note = "making her calm loop (a few seconds, once per face)"
         _reset_motion(s)
-        frames = []
-        for i in range(IDLE_CHUNKS):
-            f = _render(s, np.zeros(P["n16"], np.float32))
-            if i >= IDLE_SETTLE:
-                frames += list(f)
-        per, keep = len(f), IDLE_KEEP * len(f)
+        b = s.build = {"face": s.face, "frames": [], "i": 0}
+    f = _render(s, np.zeros(P["n16"], np.float32))
+    if b["i"] >= IDLE_SETTLE:
+        b["frames"] += list(f)
+    b["i"] += 1
+    if b["i"] == IDLE_CHUNKS:
+        frames, per = b["frames"], len(f)
+        keep = IDLE_KEEP * per
         d = _drift(s, frames)
         means = np.convolve(d, np.ones(keep) / keep, mode="valid")    # the mean drift of every window
         at = int(means.argmin())
@@ -415,10 +464,10 @@ def _idle_packets(s):
         loop = win + win[::-1]
         s.idle.update(key=s.face, at=0,
                       packets=[_pack("idle", loop[i:i + per], None) for i in range(0, len(loop), per)])
-        s.note = None
+        s.build, s.note = None, None
         logger.info(f"Idle loop made ({s.name}): {len(s.idle['packets'])} chunks from frame {at} of {len(frames)}, "
                     f"drift {means[at]:.1f} (whole render {d.mean():.1f}, worst {d.max():.1f})")
-    return s.idle["packets"]
+    return f, None
 
 
 def _render(s, a16):
@@ -431,8 +480,7 @@ def _render(s, a16):
         with contextlib.redirect_stdout(io.StringIO()):   # per-step timing prints
             video = fh.run_pipeline(_pipe, emb)
         s.t = (s.t[0], s.t[1], _pipe.latent_motion_frames)
-        frames = video.float().cpu().numpy()[P["motion"]:]
-    return frames.clip(0, 255).astype(np.uint8)
+        return video[P["motion"]:].byte().cpu().numpy()   # the engine gives 0-255 floats: trimmed and cast on the GPU, a fifth of the copy
 
 
 def _decode(data):
@@ -505,21 +553,44 @@ def _drain(s):
 
 
 def _flush(s):
-    """Stop: drop queued speech here and tell viewers to drop what they scheduled."""
-    _drain(s)
-    with s.lock:
-        s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
+    """Stop: drop queued speech here and tell viewers to drop what they
+    scheduled. The chunk being rendered right now is dropped too (gen)."""
     head = json.dumps({"kind": "flush"}).encode()
-    _broadcast(s, struct.pack(">I", len(head)) + head)
+    with s.lock:
+        s.gen += 1
+        _drain(s)
+        s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
+        _broadcast(s, struct.pack(">I", len(head)) + head)
 
 
 def _broadcast(s, pkt):
+    """To every viewer of the session. One that fell behind loses its oldest
+    packet, never the newest, so it stays near now and a stop always lands."""
     with _viewers_lock:
         for q in s.viewers:
             try:
                 q.put_nowait(pkt)
             except queue.Full:
-                pass
+                with contextlib.suppress(queue.Empty, queue.Full):
+                    q.get_nowait()
+                    q.put_nowait(pkt)
+
+
+_out = queue.Queue(maxsize=2)    # rendered chunks waiting for their JPEGs: the GPU starts the next meanwhile
+
+
+def _packer():
+    """Frames to JPEGs and out, in order, beside the render loop."""
+    while True:
+        s, gen, kind, frames, a24, pkt = _out.get()
+        try:
+            pkt = pkt or _pack(kind, frames, a24)
+        except Exception:
+            logger.exception("Packing failed")
+            continue
+        with s.lock:
+            if gen == s.gen:                     # not stopped since it was rendered
+                _broadcast(s, pkt)
 
 
 def _pick():
@@ -527,77 +598,93 @@ def _pick():
     ahead of their own clock): her words first, then a calm loop (no GPU),
     then a live idle render. A live idle never holds up anyone's words."""
     now, best = time.monotonic(), None
-    with _viewers_lock:
-        watched = [s for s in _sessions.values() if s.viewers and s.want]
-    for s in watched:
-        if s.clock is None:
-            s.clock = [now, 0.0]
-        lead = s.clock[1] - (now - s.clock[0])
-        if lead < -2.0:                         # fell behind (GPU busy): rebase
-            s.clock, lead = [now, 0.0], 0.0
-        if lead > LEAD:
-            continue
-        rank = 0 if s.talking() else 2 if _idle_mode(s) == "live" else 1
-        if best is None or (rank, lead) < best[0]:
-            best = ((rank, lead), s)
+    ahead = max(LEAD, 1.5 * P.get("render_s", 0))   # a talker keeps enough lead to sit out one other render
+    with _viewers_lock:                     # a viewer leaving clears s.clock under this same lock
+        for s in _sessions.values():
+            if not (s.viewers and s.want):
+                continue
+            if s.clock is None:
+                s.clock = [now, 0.0]
+            lead = s.clock[1] - (now - s.clock[0])
+            if lead < -2.0:                         # fell behind (GPU busy): rebase
+                s.clock, lead = [now, 0.0], 0.0
+            if lead > ahead:
+                continue
+            rank = 0 if s.talking() else 2 if _idle_mode(s) == "live" else 1
+            if best is None or (rank, lead) < best[0]:
+                best = ((rank, lead), s)
     return best and best[1]
 
 
 def _loop():
-    fails = 0
+    """The render loop, which never dies: a dead one would swallow every Sapphire's words."""
     while True:
         _watching.wait()
-        if _state["status"] != "ready":         # a viewer may come while she downloads: wait, never touch the model
-            time.sleep(0.5)
-            continue
-        s = _pick()
-        if s is None:
-            time.sleep(0.02)
-            continue
+        BEAT[0] = time.monotonic()
         try:
-            _apply_face(s)
+            _turn()
         except Exception:
-            logger.exception(f"Face not taken ({s.name})")
-            s.want = None                       # never retried in a loop; her next reply sends it again
-            continue
-        if not s.face:                          # never animate the grey warm-up card
-            time.sleep(0.05)
-            continue
-        kind, a16, a24 = _next_chunk(s)
-        t = time.perf_counter()
-        try:
-            if kind == "idle" and _idle_mode(s) == "live":
-                pkt = _pack(kind, _render(s, a16), None)      # she sits as the model has her; her next words go on from here
-                s.live = True
-            elif kind == "idle":
-                loop = _idle_packets(s)
-                pkt = loop[s.idle["at"] % len(loop)]
-                s.idle["at"] += 1
-                s.live = False
-            else:
-                if not s.live:
-                    _reset_motion(s)
-                    s.live = True
-                pkt = _pack(kind, _render(s, a16), a24)
-                logger.info(f"speech chunk rendered in {time.perf_counter() - t:.3f}s ({s.name})")
-        except Exception as e:
-            logger.exception("Render failed")
-            if a24 is not None:
-                _broadcast(s, _pack(kind, [], a24))            # her words still reach whoever took them, without a face
-            fails += 1
-            if fails >= 3:                                      # not a hiccup: stop taking her voice, say so
-                _state.update(status="error", error=f"Rendering keeps failing ({e}). Her voice plays as usual; Retry starts the face again.")
-                with _viewers_lock:
-                    every = list(_sessions.values())
-                for x in every:
-                    for _, rest in _drain(x):
-                        _broadcast(x, _pack("speech", [], rest))
+            logger.exception("Render loop")
             time.sleep(1)
-            continue
-        fails = 0
-        _broadcast(s, pkt)
-        if s.clock:
-            s.clock[1] += P["chunk_s"]
+
+
+_failing = [0]           # renders failed in a row, any session: past 6 it is the GPU, not one face
+
+
+def _turn():
+    """One chunk for the session most due: rendered here, packed and sent beside."""
+    if _state["status"] != "ready":         # a viewer may come while she downloads: wait, never touch the model
+        time.sleep(0.5)
+        return
+    s = _pick()
+    if s is None:
+        time.sleep(0.02)
+        return
+    try:
+        _apply_face(s)
+    except Exception:
+        logger.exception(f"Face not taken ({s.name})")
+        s.want = None                       # never retried in a loop; her next reply sends it again
+        return
+    if not s.face:                          # never animate the grey warm-up card
+        time.sleep(0.05)
+        return
+    kind, a16, a24 = _next_chunk(s)
+    gen, t = s.gen, time.perf_counter()
+    try:
+        pkt = None
+        if kind == "idle" and _idle_mode(s) == "live":
+            frames = _render(s, a16)            # she sits as the model has her; her next words go on from here
+            s.live, s.build = True, None
+        elif kind == "idle":
+            frames, pkt = _idle_step(s)
+            s.live = False
+        else:
+            if not s.live:
+                _reset_motion(s)
+                s.live = True
+            s.build = None                      # her motion moved on: a calm loop half made starts again
+            frames = _render(s, a16)
+            logger.info(f"speech chunk rendered in {time.perf_counter() - t:.3f}s ({s.name})")
+    except Exception as e:
+        logger.exception(f"Render failed ({s.name})")
+        if a24 is not None:
+            _out.put((s, gen, kind, [], a24, None))   # her words still reach whoever took them, without a face
+        s.fails += 1
+        _failing[0] += 1
+        if s.fails >= 3:                    # this face won't render: her voice goes back to her own computer
+            s.fails, s.want = 0, None
+            for _, rest in _drain(s):
+                _out.put((s, s.gen, "speech", [], rest, None))
+        if _failing[0] >= 6:                # every face fails: the GPU is in trouble, say so
+            _state.update(status="error", error=f"Rendering keeps failing ({e}). Her voice plays as usual; Retry starts the face again.")
+        time.sleep(1)
+        return
+    s.fails = _failing[0] = 0
+    _out.put((s, gen, kind, frames, a24, pkt))
+    c = s.clock                             # a viewer leaving may clear it meanwhile
+    if c:
+        c[1] += P["chunk_s"]
 
 
 def _inside(path):
@@ -621,8 +708,7 @@ def _face_bytes(s, data):
         folder.mkdir(parents=True, exist_ok=True)
         img.save(dest)
         for old in sorted(folder.glob("*.png"), key=lambda f: f.stat().st_mtime)[:-FACES_KEPT]:
-            old.unlink(missing_ok=True)
-    dest.touch()                                # used now: kept longest
+            old.unlink(missing_ok=True)         # never touched when sent again: its mtime is part of the face's key
     return str(dest)
 
 
@@ -636,11 +722,11 @@ class Handler(BaseHTTPRequestHandler):
         cross-site POST, which cannot set one without a preflight this server
         never answers."""
         if getattr(self.server, "door", None):
-            name = worker_door.client_of(self.server.door, self.headers.get("Authorization"))
+            name = worker_door.admit(self)
             if not name:
                 self._json({"error": "unauthorized"}, 401)
                 return None
-            return _session(name)
+            return _session(name, door=True)
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
         if host in ("127.0.0.1", "localhost") and (not post or self.headers.get("X-FlashHead") == "1"):
             return _session("local")
@@ -663,8 +749,11 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/health":
             with _viewers_lock:
                 viewers, listeners = len(s.viewers), sum(s.viewers.values())
-            return self._json({**_state, "note": s.note or _state["note"], "face": bool(s.face),
-                               "viewers": viewers, "listeners": listeners})
+            info = {**_state, "note": s.note or _state["note"], "face": bool(s.face),
+                    "viewers": viewers, "listeners": listeners}
+            if getattr(self.server, "door", None) and info["error"]:
+                info["error"] = _private(info["error"])
+            return self._json(info)
         if url.path != "/stream":
             return self._json({"error": "not found"}, 404)
         q = queue.Queue(maxsize=VIEWER_QUEUE)
@@ -676,12 +765,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+        door, checked, gone = getattr(self.server, "door", None), time.monotonic(), False
         try:
             while True:
                 try:
                     pkt = q.get(timeout=5)
                 except queue.Empty:
                     pkt = struct.pack(">I", 2) + b"{}"       # keepalive
+                if door and time.monotonic() - checked > 5:  # removed, or given a new key: its stream ends here
+                    checked = time.monotonic()
+                    if worker_door.client_of(door, self.headers.get("Authorization")) != s.name:
+                        gone = True
+                        break
                 self.wfile.write(pkt)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -689,18 +784,27 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _viewers_lock:
                 s.viewers.pop(q, None)
-                if not s.viewers:
+                last = not s.viewers
+                if last:
                     s.clock = None
-                    _drain(s)
+                if gone:
+                    _sessions.pop(("door", s.name), None)   # its face, motion and words go with it
                 if not any(x.viewers for x in _sessions.values()):
                     _watching.clear()
+            if last:
+                with s.lock:                     # nobody to hear it: no old sentence waits for the next viewer
+                    _drain(s)
+                    s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
+            if gone:
+                shutil.rmtree(FACES / s.name, ignore_errors=True)
+                logger.info(f"{s.name} is no longer let in: its stream is closed and its faces deleted")
             logger.info(f"Viewer left ({s.name}: {len(s.viewers)})")
 
     def do_POST(self):
         s = self._caller(post=True)
         if not s:
             return
-        data = self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 16 * 2**20))
+        data = self.rfile.read(max(0, min(int(self.headers.get("Content-Length", 0)), 16 * 2**20)))
         url = urlsplit(self.path)
         query = parse_qs(url.query)
         if url.path == "/face":
@@ -723,7 +827,8 @@ class Handler(BaseHTTPRequestHandler):
             _flush(s)
             return self._json({"ok": True})
         if url.path == "/speak":
-            if _state["status"] != "ready" or not s.viewers or not s.face:
+            if (_state["status"] != "ready" or not s.viewers or not s.face or not s.want
+                    or time.monotonic() - BEAT[0] > 15):   # no face to give, or the loop stalled: she speaks at home
                 return self._json({"taken": False})
             try:
                 _queue_speech(s, data)
@@ -736,6 +841,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def _private(text):
+    """An error as another computer may see it: without this computer's folders or user name."""
+    text = str(text).replace(str(ROOT), "<sapphire>")
+    return text.replace(str(Path.home()), "~")
 
 
 def _open_door():
@@ -755,7 +866,10 @@ def _open_door():
 if __name__ == "__main__":
     threading.Thread(target=_load, daemon=True).start()
     threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_packer, daemon=True, name="flashhead-packer").start()
     if _START.get("share"):
         _open_door()
     logger.info(f"FlashHead server on 127.0.0.1:{PORT}, models in {MODELS}")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    class Local(ThreadingHTTPServer):
+        allow_reuse_address = sys.platform != "win32"     # Windows lets a second copy share a taken port, silently
+    Local(("127.0.0.1", PORT), Handler).serve_forever()

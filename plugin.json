@@ -1,7 +1,7 @@
 {
   "name": "flashhead",
   "short_display_name": "FlashHead",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "min_core_version": "2.15.3",
   "description": "Live talking face — SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
   "author": "sapphire",
@@ -178,7 +178,7 @@
         "default": "",
         "tab": "Advanced",
         "show_if": {"client": true},
-        "placeholder": "https://192.168.0.10:5018/#key=...&pin=...",
+        "placeholder": "https://192.0.2.10:5018/#key=...&pin=...",
         "help": "Its pairing string: on that computer, Settings > FlashHead > Advanced, turn on Share this GPU, then Add a computer (or flashhead-server's add command). Her face here is sent there; her words go there and come back with her face."
       },
       {

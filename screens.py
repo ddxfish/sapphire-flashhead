@@ -155,9 +155,9 @@ def _watch(boards, mode):
                 if head.get("kind") == "flush":
                     last_word = now - HOLD_S + 1
                     continue
+                body = read(head.get("audio", 0) + sum(head.get("frames", [])))   # always the whole packet: the stream stays in step
                 if not head.get("frames"):
                     continue
-                body = read(head["audio"] + sum(head["frames"]))
                 if head["kind"] == "speech":
                     last_word = now
                     _wake.clear()                    # the reply that woke us is here
