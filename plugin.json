@@ -1,0 +1,190 @@
+{
+  "name": "flashhead",
+  "short_display_name": "FlashHead",
+  "version": "0.6.0",
+  "min_core_version": "2.15.1",
+  "description": "Live talking face — SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
+  "author": "sapphire",
+  "icon": "🗣️",
+  "priority": 50,
+  "default_enabled": false,
+  "privacy_aware": true,
+  "surfaces": [
+    "chat"
+  ],
+  "platforms": [
+    "linux",
+    "win32"
+  ],
+  "settingsUI": "plugin",
+  "environment": {
+    "python": "3.10",
+    "pip": [
+      "--extra-index-url=https://download.pytorch.org/whl/cu128",
+      "torch==2.7.1+cu128",
+      "torchvision==0.22.1+cu128",
+      "triton-windows>=3.3,<3.4; sys_platform == \"win32\"",
+      "transformers==4.57.3",
+      "diffusers==0.39.0",
+      "accelerate>=1.8.1",
+      "einops",
+      "pyloudnorm",
+      "loguru",
+      "pyyaml",
+      "pillow",
+      "av",
+      "huggingface_hub"
+    ]
+  },
+  "capabilities": {
+    "services": [
+      {
+        "name": "server",
+        "entry": "server.py",
+        "port": 5017,
+        "port_setting": "port"
+      }
+    ],
+    "hooks": {
+      "tts_stream_start": "hooks/voice.py",
+      "tts_chunk_audio": "hooks/voice.py",
+      "tts_stream_end": "hooks/voice.py"
+    },
+    "routes": [
+      {
+        "method": "GET",
+        "path": "status",
+        "handler": "routes/api.py:status"
+      },
+      {
+        "method": "GET",
+        "path": "stream",
+        "handler": "routes/api.py:stream"
+      },
+      {
+        "method": "GET",
+        "path": "face",
+        "handler": "routes/api.py:get_face",
+        "media": true
+      },
+      {
+        "method": "POST",
+        "path": "face",
+        "handler": "routes/api.py:upload_face"
+      },
+      {
+        "method": "DELETE",
+        "path": "face",
+        "handler": "routes/api.py:reset_face"
+      },
+      {
+        "method": "POST",
+        "path": "moods/{name}",
+        "handler": "routes/api.py:upload_mood"
+      },
+      {
+        "method": "DELETE",
+        "path": "moods/{name}",
+        "handler": "routes/api.py:delete_mood"
+      },
+      {
+        "method": "POST",
+        "path": "restart",
+        "handler": "routes/api.py:restart"
+      },
+      {
+        "method": "GET",
+        "path": "models",
+        "handler": "routes/api.py:models"
+      }
+    ],
+    "sidebar_accordion": {
+      "title": "FlashHead",
+      "icon": "🗣️",
+      "content": "sidebar.html",
+      "script": "sidebar.js"
+    },
+    "app": {
+      "label": "FlashHead",
+      "icon": "🗣️",
+      "description": "Her live talking face, full size",
+      "nav": "chat"
+    },
+    "settings": [
+      {
+        "key": "idle",
+        "type": "string",
+        "label": "Between her words",
+        "default": "loop",
+        "options": [
+          {
+            "label": "Calm loop (the GPU rests)",
+            "value": "loop"
+          },
+          {
+            "label": "Live (always moving, uses the GPU while watched)",
+            "value": "live"
+          }
+        ],
+        "help": "Loop: a few calm seconds rendered once per face and replayed, the stretch closest to her real face. Live: rendered as she sits, never repeats, and her next words flow on from where she is; the GPU works the whole time someone watches."
+      },
+      {
+        "key": "screens",
+        "type": "string",
+        "label": "Her face on her screens",
+        "default": "talking",
+        "options": [
+          {
+            "label": "Off",
+            "value": "off"
+          },
+          {
+            "label": "While she talks",
+            "value": "talking"
+          },
+          {
+            "label": "Always",
+            "value": "always"
+          }
+        ],
+        "help": "Sapphire ESP32 satellites with a screen (the Waveshare board on satellite firmware 0.7.7+) show her face: while she talks, or always (her idle loop at 2 fps between replies). A board stays a speaker first; nothing else on it changes."
+      },
+      {
+        "key": "persona",
+        "type": "string",
+        "label": "Persona face",
+        "default": "",
+        "help": "Empty: the avatar of the persona in the chat she speaks in, so the face follows whoever is talking. A persona's name pins that one. An uploaded face (Faces tab) wins over both.",
+        "placeholder": "follow the chat"
+      },
+      {
+        "key": "port",
+        "type": "number",
+        "label": "Server port",
+        "default": 5017,
+        "help": "Local port for the FlashHead model server. Saving restarts the service.",
+        "tab": "Advanced"
+      },
+      {
+        "key": "models_dir",
+        "type": "string",
+        "label": "Models folder",
+        "default": "",
+        "tab": "Advanced",
+        "placeholder": "user/models/flashhead",
+        "help": "Where her models (about 8 GB) download to and load from. Empty: user/models/flashhead, which Sapphire's backups always skip (they download again if lost). Point it at a folder you already have (holding SoulX-FlashHead-1_3B and wav2vec2-base-960h) to use those, or at an empty one on another drive and they download there. A folder elsewhere inside user/ would be backed up. Saving restarts the service."
+      },
+      {
+        "key": "install_test",
+        "type": "boolean",
+        "label": "Test the install without a GPU",
+        "default": false,
+        "tab": "Advanced",
+        "help": "For a machine with no NVIDIA GPU (a VM): fetch the engine and models (~8 GB) and import the engine anyway, then say whether every step worked. It never renders. Saving restarts the service."
+      }
+    ],
+    "daemon": {
+      "entry": "screens.py"
+    }
+  }
+}

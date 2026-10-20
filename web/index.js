@@ -1,0 +1,150 @@
+// FlashHead settings: the manifest's knobs (core's form renderer) and a Faces
+// tab for what a form can't hold: her face and her mood faces, which save on
+// their own buttons. The sidebar's ⚙ opens this tab.
+import { registerPluginSettings } from '/static/shared/plugin-registry.js';
+import pluginsAPI from '/static/shared/plugins-api.js';
+import { renderSettingsForm, readSettingsForm } from '/static/shared/plugin-settings-renderer.js';
+import { BASE, csrf } from './player.js';
+
+async function schema() {
+    const list = await pluginsAPI.listPlugins();
+    return (list.plugins || []).find(p => p.name === 'flashhead')?.settings_schema || [];
+}
+
+function upload(url, file) {
+    const fd = new FormData();
+    fd.append('file', file);
+    return fetch(url, { method: 'POST', body: fd, headers: { 'X-CSRF-Token': csrf() } });
+}
+
+function mountFaces(el) {
+    el.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:14px;">
+            <div>
+                <div style="font-weight:600;margin-bottom:4px;">Her face</div>
+                <div style="color:var(--text-muted);font-size:var(--font-sm,12px);margin-bottom:8px;">
+                    Her persona avatar, unless you upload one here. Square works best; it is cropped to 512 px.</div>
+                <div style="display:flex;gap:12px;align-items:center;">
+                    <img class="fh-base" style="width:96px;height:96px;border-radius:8px;object-fit:cover;background:#000;">
+                    <div style="display:flex;flex-direction:column;gap:6px;">
+                        <button class="btn fh-upload">Upload face</button>
+                        <button class="btn fh-reset">Use her avatar</button>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <div style="font-weight:600;margin-bottom:4px;">Moods</div>
+                <div style="color:var(--text-muted);font-size:var(--font-sm,12px);margin-bottom:8px;">
+                    A face shown while one of her emotion pieces is active. Name it after the emotion (happy, sad, excited).</div>
+                <div class="fh-moods" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;"></div>
+            </div>
+            <div class="fh-note" style="color:var(--text-muted);font-size:var(--font-sm,12px);"></div>
+            <input class="fh-file" type="file" accept="image/*" hidden>
+            <input class="fh-mood-file" type="file" accept="image/*" hidden>
+        </div>`;
+    const $ = s => el.querySelector(s);
+    const note = t => { $('.fh-note').textContent = t; };
+    let pending = '';
+
+    async function refresh() {
+        $('.fh-base').src = `${BASE}/face?t=${Date.now()}`;
+        const s = await (await fetch(`${BASE}/status`)).json().catch(() => ({}));
+        const box = $('.fh-moods');
+        box.innerHTML = '';
+        for (const m of s.moods || []) {
+            const chip = document.createElement('div');
+            chip.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:3px;font-size:12px;';
+            chip.innerHTML = `<img src="${BASE}/face?mood=${encodeURIComponent(m)}&t=${Date.now()}"
+                    style="width:64px;height:64px;border-radius:6px;object-fit:cover;border:2px solid ${m === s.mood ? 'var(--accent-blue,#4a9eff)' : 'transparent'};">
+                <span>${m} <a href="#" title="Remove" style="color:var(--text-muted)">×</a></span>`;
+            chip.querySelector('a').onclick = async e => {
+                e.preventDefault();
+                await fetch(`${BASE}/moods/${encodeURIComponent(m)}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf() } });
+                note(`mood "${m}" removed`);
+                refresh();
+            };
+            box.appendChild(chip);
+        }
+        const add = document.createElement('button');
+        add.className = 'btn';
+        add.textContent = '+ Mood';
+        add.onclick = () => {
+            pending = (prompt('Emotion name (matches her emotion piece, e.g. happy):') || '').trim();
+            if (pending) $('.fh-mood-file').click();
+        };
+        box.appendChild(add);
+    }
+
+    $('.fh-upload').onclick = () => $('.fh-file').click();
+    $('.fh-file').onchange = async e => {
+        const f = e.target.files[0];
+        e.target.value = '';
+        if (!f) return;
+        const r = await upload(`${BASE}/face`, f);
+        note(r.ok ? 'face uploaded: she wears it now' : `upload failed: ${(await r.json().catch(() => ({}))).error || r.status}`);
+        refresh();
+    };
+    $('.fh-reset').onclick = async () => {
+        await fetch(`${BASE}/face`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf() } });
+        note('back to her avatar');
+        refresh();
+    };
+    $('.fh-mood-file').onchange = async e => {
+        const f = e.target.files[0];
+        e.target.value = '';
+        if (!f || !pending) return;
+        const r = await upload(`${BASE}/moods/${encodeURIComponent(pending)}`, f);
+        note(r.ok ? `mood "${pending}" saved` : `mood upload failed: ${(await r.json().catch(() => ({}))).error || r.status}`);
+        refresh();
+    };
+    refresh();
+}
+
+// Advanced: where her models live, so they can be backed up or moved.
+async function mountModels(el) {
+    el.innerHTML = `<div style="margin-top:6px;">
+        <div style="font-weight:600;margin-bottom:4px;">Where her models live now</div>
+        <code class="fh-folder" style="display:block;word-break:break-all;padding:6px 8px;border-radius:6px;background:var(--bg-tertiary,rgba(127,127,127,.12));"></code>
+        <div class="fh-parts" style="color:var(--text-muted);font-size:var(--font-sm,12px);margin-top:6px;"></div></div>`;
+    try {
+        const m = await (await fetch(`${BASE}/models`)).json();
+        el.querySelector('.fh-folder').textContent = m.folder;
+        el.querySelector('.fh-parts').textContent = m.parts
+            .map(p => `${p.name}: ${p.present ? `${p.gb} GB` : 'not there yet (downloads on start)'}`).join(' · ');
+    } catch { el.querySelector('.fh-folder').textContent = 'unknown'; }
+}
+
+const RESTARTS = ['port', 'models_dir', 'install_test'];      // read once at service start: a change restarts it
+
+export default {
+    name: 'flashhead',
+
+    init() {
+        let fields = [], saved = {};
+        registerPluginSettings({
+            id: 'flashhead',
+            name: 'FlashHead',
+            icon: '🗣️',
+            helpText: 'Her live face: idle, screens, faces and moods',
+            async load() {
+                fields = await schema();
+                saved = await pluginsAPI.getSettings('flashhead');
+                return saved;
+            },
+            render: (container, settings) =>
+                renderSettingsForm(container, fields, settings,
+                    { slots: [{ tab: 'Faces', mount: mountFaces }, { tab: 'Advanced', mount: mountModels }] }),
+            async save(s) {
+                const out = await pluginsAPI.saveSettings('flashhead', s);
+                const restart = RESTARTS.some(k => String(s[k] ?? '') !== String(saved[k] ?? ''));
+                saved = { ...saved, ...s };
+                if (restart) await fetch(`${BASE}/restart`, { method: 'POST', headers: { 'X-CSRF-Token': csrf() } });
+                return out;
+            },
+            getSettings: container => readSettingsForm(container, fields),
+            reset: () => pluginsAPI.resetSettings('flashhead'),
+        });
+    },
+
+    destroy() {},
+};
