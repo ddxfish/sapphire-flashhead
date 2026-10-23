@@ -23,12 +23,15 @@ on 127.0.0.1 with no key. The same calls serve both:
   POST /face?idle=      {"path": image} (local only) or the image itself
                         (Content-Type image/*) - animate this face; idle=loop|live
   POST /speak?take=1    raw audio (any format PyAV reads), mouthed while anyone watches;
-                        {"taken": true} only when asked to take it and a viewer plays sound
+                        {"taken": true} only when asked to take it and a viewer plays sound;
+                        not taken, the face mouths it in silence (it plays elsewhere)
+  POST /viewer          a browser's numbers for the reply it played (JSON): one log line
   POST /flush           she was stopped: drop what is queued
   POST /end             her reply is over: its last words go out now (until then a
                         gap in her words holds the face, it never idles mid-reply)
   GET  /stream?audio=0  packets: >I header length, JSON header, s16 PCM, JPEG frames;
-                        audio=0 = a viewer that shows frames only (her screens)
+                        audio=0 = a viewer that shows frames only (her screens); of the
+                        others the newest plays her voice, the rest get packets without it
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import contextlib
@@ -122,6 +125,7 @@ class Session:
         self.pending = {"a16": np.zeros(0, np.float32), "a24": np.zeros(0, np.int16)}
         self.lock = threading.Lock()
         self.viewers = {}           # queue -> plays the sound (a browser) or frames only (a board)
+        self.voice = None           # the one viewer that plays her voice (the newest browser): two would echo
         self.idle = {"key": None, "packets": [], "at": 0}
         self.live = False           # her motion runs on from the last chunk; False: speech starts her afresh
         self.clock = None           # [t0, seconds made] while watched
@@ -527,8 +531,10 @@ def _decode(data):
     return outs[P["sr"]].astype(np.float32), outs[PLAY_SR].astype(np.int16)
 
 
-def _queue_speech(s, data):
+def _queue_speech(s, data, mute=False):
     a16, a24 = _decode(data)
+    if mute:                                 # a device or her speakers play it: the face only mouths it
+        a24 = np.zeros_like(a24)
     with s.lock:
         p16 = np.concatenate((s.pending["a16"], a16))
         p24 = np.concatenate((s.pending["a24"], a24))
@@ -567,7 +573,10 @@ def _jpeg(f):
 
 
 def _pack(kind, frames, a24):
-    jpegs = [_jpeg(f) for f in frames]
+    return _packet(kind, [_jpeg(f) for f in frames], a24)
+
+
+def _packet(kind, jpegs, a24):
     audio = a24.tobytes() if a24 is not None else b""
     head = json.dumps({"kind": kind, "fps": P["fps"], "sr": PLAY_SR, "audio": len(audio),
                        "frames": [len(j) for j in jpegs]}).encode()
@@ -596,18 +605,23 @@ def _flush(s):
         _broadcast(s, struct.pack(">I", len(head)) + head)
 
 
-def _broadcast(s, pkt):
+def _broadcast(s, pkt, quiet=None):
     """To every viewer of the session. One that fell behind loses its oldest
-    packet, never the newest, so it stays near now and a stop always lands."""
+    packet, never the newest, so it stays near now and a stop always lands.
+    `quiet`: the same without her voice, for every viewer but s.voice (b"":
+    nothing for them), so a second tab or window never plays her a beat apart."""
     with _viewers_lock:
         for q in s.viewers:
+            p = pkt if quiet is None or s.voice in (None, q) else quiet
+            if not p:
+                continue
             try:
-                q.put_nowait(pkt)
+                q.put_nowait(p)
             except queue.Full:
                 s.drops += 1
                 with contextlib.suppress(queue.Empty, queue.Full):
                     q.get_nowait()
-                    q.put_nowait(pkt)
+                    q.put_nowait(p)
 
 
 _out = queue.Queue(maxsize=2)    # rendered chunks waiting for their JPEGs: the GPU starts the next meanwhile
@@ -617,14 +631,19 @@ def _packer():
     """Frames to JPEGs and out, in order, beside the render loop."""
     while True:
         s, gen, kind, frames, a24, pkt = _out.get()
+        quiet = None
         try:
-            pkt = pkt or _pack(kind, frames, a24)
+            if pkt is None:
+                jpegs = [_jpeg(f) for f in frames]
+                pkt = _packet(kind, jpegs, a24)
+                if a24 is not None:
+                    quiet = _packet(kind, jpegs, None) if jpegs else b""
         except Exception:
             logger.exception("Packing failed")
             continue
         with s.lock:
             if gen == s.gen:                     # not stopped since it was rendered
-                _broadcast(s, pkt)
+                _broadcast(s, pkt, quiet)
 
 
 def _pick():
@@ -755,6 +774,22 @@ def _run_end(s):
                 f"rebases {r['rebases']}, drops {s.drops - r['drops']}")
 
 
+def _viewer_log(s, data):
+    """One line per reply from the browser that played it: what this server
+    cannot see. Gaps: her voice paused for a late packet (GPU or network).
+    Late: frames that missed their moment (a busy CPU or page). Out: the
+    audio path's delay, which her mouth waits for."""
+    try:
+        v = {k: float(x) for k, x in json.loads(data).items() if isinstance(x, (int, float))}
+    except (ValueError, AttributeError):
+        return
+    logger.info(f"viewer ({s.name}): {v.get('packets', 0):.0f} packets, gaps {v.get('gaps', 0):.0f} "
+                f"({v.get('gap_s', 0):.2f}s), decode avg/max {v.get('wait_ms', 0):.0f}/{v.get('wait_max', 0):.0f} ms, "
+                f"late frames {v.get('late', 0):.0f}, page stalls {v.get('stalls', 0):.0f}, "
+                f"audio out {v.get('out', 0):.3f}s ({'the device clock' if v.get('clock') else 'reported'}), {v.get('sr', 0):.0f} Hz"
+                + (f", audio paused {v['paused']:.0f}x" if v.get("paused") else ""))
+
+
 def _inside(path):
     """A face only from inside Sapphire's folder (avatars, uploads): never any picture on the disk."""
     try:
@@ -827,12 +862,15 @@ class Handler(BaseHTTPRequestHandler):
         q = queue.Queue(maxsize=VIEWER_QUEUE)
         with _viewers_lock:
             s.viewers[q] = parse_qs(url.query).get("audio", ["1"])[0] != "0"
+            if s.viewers[q]:
+                s.voice = q                      # the newest browser plays her voice; any other mouths it silently
             _watching.set()
         try:                                     # what the browser says its audio path adds (Bluetooth: 0.15-0.3 s)
             lat = f", audio out {float(parse_qs(url.query)['lat'][0]):.3f}s"
         except (KeyError, ValueError, IndexError):
             lat = ""
-        logger.info(f"Viewer joined ({s.name}: {len(s.viewers)}{lat})")
+        logger.info(f"Viewer joined ({s.name}: {len(s.viewers)}{lat}"
+                    + (", plays her voice" if s.voice is q and len(s.viewers) > 1 else "") + ")")
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -856,6 +894,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _viewers_lock:
                 s.viewers.pop(q, None)
+                if s.voice is q:
+                    s.voice = next((v for v, sound in s.viewers.items() if sound), None)
                 last = not s.viewers
                 if last:
                     s.clock = None
@@ -901,6 +941,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/flush":
             _flush(s)
             return self._json({"ok": True})
+        if url.path == "/viewer":
+            _viewer_log(s, data)
+            return self._json({"ok": True})
         if url.path == "/end":
             s.open = False                       # her last words go out now, then she idles
             return self._json({"ok": True})
@@ -914,10 +957,10 @@ class Handler(BaseHTTPRequestHandler):
             if why:                              # no face to give, or the loop stalled: she speaks at home
                 return self._json({"taken": False, "why": why})
             try:
-                _queue_speech(s, data)
-                s.open, s.heard = True, time.monotonic()
                 take = query.get("take", ["0"])[0] == "1"
                 taken = take and any(s.viewers.values())
+                _queue_speech(s, data, mute=not taken)   # played elsewhere: a viewer playing it too was a late echo
+                s.open, s.heard = True, time.monotonic()
                 return self._json({"taken": taken, "why": "" if taken else "no listener" if take else "a device plays it"})
             except Exception as e:
                 logger.warning(f"Speak decode failed ({s.name}): {e}")

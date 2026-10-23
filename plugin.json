@@ -99,6 +99,11 @@
         "handler": "routes/api.py:restart"
       },
       {
+        "method": "POST",
+        "path": "viewer",
+        "handler": "routes/api.py:viewer"
+      },
+      {
         "method": "GET",
         "path": "models",
         "handler": "routes/api.py:models"

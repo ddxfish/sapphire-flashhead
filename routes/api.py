@@ -64,6 +64,18 @@ async def stream(settings=None, query=None, **_):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+async def viewer(request=None, settings=None, **_):
+    """The browser's numbers for a reply it played, to the server's log beside its own."""
+    try:
+        body = await request.body()
+        kw = await asyncio.to_thread(faces.httpx_kwargs, settings)
+        async with httpx.AsyncClient(timeout=2, **kw) as c:
+            await c.post(f"{faces.base_url(settings)}/viewer", content=body[:2048])
+    except Exception as e:
+        logger.debug(f"[flashhead] viewer numbers not logged: {e}")
+    return {"ok": True}
+
+
 def get_face(settings=None, query=None, **_):
     """The base face, or ?mood=<name> for a mood thumbnail."""
     from fastapi.responses import FileResponse, JSONResponse

@@ -1,24 +1,39 @@
 // FlashHead viewer — one module behind the sidebar and the app page.
 // The stream is packets of (header, PCM, JPEG frames) for the same 0.96 s;
-// WebAudio's clock places both, so the mouth can't drift from the voice.
+// each is decoded whole, then its voice and frames are placed together on
+// WebAudio's clock, read where the ear is: the mouth can't drift from the voice.
 export const BASE = '/api/plugin/flashhead';
 export const csrf = () => document.querySelector('meta[name="csrf-token"]')?.content || '';
 
 function createPlayer(canvas) {
     const g = canvas.getContext('2d');
     let ctx = null, abort = null, raf = 0, next = 0, frames = [], sources = [], gen = 0;
+    let chain = Promise.resolve(), voiced = false, voiceEnd = 0, lastRaf = 0, clock = 0;
+    const fresh = () => ({ packets: 0, gaps: 0, gap_s: 0, wait: 0, wait_max: 0, late: 0, stalls: 0, paused: 0 });
+    let st = fresh();                   // this reply's numbers: one line in her server log when she goes quiet
 
-    // When a sound scheduled at t is HEARD: t plus what the audio path adds
-    // (WASAPI ~10-40 ms, Bluetooth 150-300 ms). Her mouth follows the ear.
-    const heard = () => ctx.currentTime - (ctx.outputLatency || ctx.baseLatency || 0);
+    // The moment now being heard: the device's own timestamp (WASAPI, USB,
+    // HDMI, Bluetooth, every buffer between), else the latencies it reports.
+    // Her mouth follows the ear, not the scheduler.
+    function heard() {
+        const ts = ctx.getOutputTimestamp?.();
+        if (ts && ts.contextTime > 0) {
+            const t = ts.contextTime + Math.max(0, performance.now() - ts.performanceTime) / 1000;
+            if (t <= ctx.currentTime && t > ctx.currentTime - 1) { clock = 1; return t; }
+        }
+        clock = 0;
+        return ctx.currentTime - (ctx.baseLatency || 0) - (ctx.outputLatency || 0);
+    }
 
-    function draw() {
+    function draw(ms) {
         raf = requestAnimationFrame(draw);
         if (!ctx) return;
+        if (voiced && lastRaf && ms - lastRaf > 250 && ms - lastRaf < 5000) st.stalls++;   // the page froze mid-reply
+        lastRaf = ms;
         const now = heard();
         let show = null;
         while (frames.length && frames[0].t <= now) {
-            if (show) show.bmp.close();
+            if (show) { show.bmp.close(); if (now - show.t > 0.1) st.late++; }    // never shown: its moment passed
             show = frames.shift();
         }
         if (show) {
@@ -27,23 +42,53 @@ function createPlayer(canvas) {
             g.drawImage(show.bmp, 0, 0, canvas.width, canvas.height);
             show.bmp.close();
         }
+        if (st.packets && ctx.currentTime > voiceEnd + 1.5) report();
+    }
+
+    function report() {
+        const out = { ...st, wait_ms: st.wait / st.packets, out: Math.max(0, ctx.currentTime - heard()), clock, sr: ctx.sampleRate };
+        delete out.wait;
+        st = fresh();
+        voiced = false;
+        fetch(`${BASE}/viewer`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
+                                  body: JSON.stringify(out) }).catch(() => {});
     }
 
     function flush() {                  // she was stopped: cut what's scheduled
-        gen++;                          // frames still decoding belong to what was cut
+        gen++;                          // packets still decoding belong to what was cut
         const now = heard();
         sources.forEach(s => { try { s.stop(); } catch {} });
         sources = [];
         frames = frames.filter(f => (f.t <= now) || (f.bmp.close(), false));
         next = 0;
+        voiced = false;
     }
 
+    // A packet's frames are decoded BEFORE its voice is scheduled, and both
+    // are placed together, in arrival order: a busy CPU then delays her
+    // whole (a pause), it never lets her voice run on while her mouth waits.
     function schedule(head, bytes, off) {
+        const g0 = gen, got = performance.now();
+        const audio = head.audio ? bytes.slice(off, off + head.audio) : null;
+        let p = off + head.audio;
+        const hidden = document.hidden;     // a background tab: her voice plays on, frames nobody can see are not decoded
+        const decoded = Promise.all(hidden ? [] : head.frames.map(len =>
+            createImageBitmap(new Blob([bytes.subarray(p, p += len)], { type: 'image/jpeg' })).catch(() => null)));
+        chain = chain.then(() => decoded).then(bmps => {
+            if (!ctx || g0 !== gen) return bmps.forEach(b => b?.close());     // stopped or flushed while it decoded
+            place(head, audio, bmps, performance.now() - got);
+        }).catch(() => {});
+    }
+
+    function place(head, audio, bmps, waited) {
         const dur = head.frames.length ? head.frames.length / head.fps : head.audio / 2 / head.sr;   // her voice without a face still takes its time
         const t = Math.max(next, ctx.currentTime + 0.15);
-        next = t + dur;
-        if (head.audio) {
-            const pcm = new Int16Array(bytes.slice(off, off + head.audio).buffer);
+        if (audio) {
+            if (voiced && t > next + 0.02) { st.gaps++; st.gap_s += t - next; }     // she was mid-reply and this came late
+            st.packets++; st.wait += waited; st.wait_max = Math.max(st.wait_max, waited);
+            voiced = true;
+            voiceEnd = t + dur;
+            const pcm = new Int16Array(audio.buffer);
             const buf = ctx.createBuffer(1, pcm.length, head.sr);
             const ch = buf.getChannelData(0);
             for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
@@ -53,23 +98,14 @@ function createPlayer(canvas) {
             src.start(t);
             sources.push(src);
             src.onended = () => { sources = sources.filter(s => s !== src); };
-        }
-        let p = off + head.audio;
-        if (document.hidden) return;        // a background tab: her voice plays on, frames nobody can see are not decoded
-        const g = gen;
-        head.frames.forEach((len, i) => {
-            const blob = new Blob([bytes.subarray(p, p + len)], { type: 'image/jpeg' });
-            p += len;
-            createImageBitmap(blob).then(bmp => {
-                if (!ctx || g !== gen) return bmp.close();      // stopped or flushed while it decoded
-                frames.push({ t: t + i / head.fps, bmp });
-                frames.sort((a, b) => a.t - b.t);
-            });
-        });
+        } else voiced = false;
+        next = t + dur;
+        bmps.forEach((bmp, i) => bmp && frames.push({ t: t + i / head.fps, bmp }));
     }
 
     async function start() {
         ctx = new AudioContext();
+        ctx.onstatechange = () => { if (ctx && ctx.state !== 'running') st.paused++; };   // Windows: a device change or sleep stops the clock
         next = 0;
         abort = new AbortController();
         raf = requestAnimationFrame(draw);
@@ -99,6 +135,8 @@ function createPlayer(canvas) {
     }
 
     function stop() {
+        if (ctx && st.packets) report();
+        gen++;                              // a packet still decoding never lands in the next Watch
         abort?.abort();
         cancelAnimationFrame(raf);
         frames.forEach(f => f.bmp.close());
