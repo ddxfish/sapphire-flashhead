@@ -1,7 +1,7 @@
 {
   "name": "flashhead",
   "short_display_name": "Avatar FlashHead",
-  "version": "0.8.1",
+  "version": "1.3.3",
   "min_core_version": "2.15.3",
   "description": "Live talking face — SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
   "author": "Teri and Chris",

@@ -31,7 +31,7 @@ async def status(settings=None, **_):
     return out
 
 
-async def stream(settings=None, **_):
+async def stream(settings=None, query=None, **_):
     from fastapi.responses import JSONResponse, StreamingResponse
     base = faces.base_url(settings)
     path, _ = faces.current(settings)
@@ -43,7 +43,11 @@ async def stream(settings=None, **_):
         if path:
             url, body, headers = faces.face_body(path, settings)
             await client.post(f"{base}{url}", content=body, headers=headers)
-        resp = await client.send(client.build_request("GET", f"{base}/stream"), stream=True)
+        try:                                # the browser's audio latency, for the server's log line
+            lat = f"?lat={float((query or {}).get('lat') or 0):.3f}"
+        except (TypeError, ValueError):
+            lat = ""
+        resp = await client.send(client.build_request("GET", f"{base}/stream{lat}"), stream=True)
     except Exception as e:
         await client.aclose()
         return JSONResponse({"error": f"FlashHead service unreachable: {e}"}, status_code=503)

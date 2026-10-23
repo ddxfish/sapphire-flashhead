@@ -6,12 +6,16 @@ export const csrf = () => document.querySelector('meta[name="csrf-token"]')?.con
 
 function createPlayer(canvas) {
     const g = canvas.getContext('2d');
-    let ctx = null, abort = null, raf = 0, next = 0, frames = [], sources = [];
+    let ctx = null, abort = null, raf = 0, next = 0, frames = [], sources = [], gen = 0;
+
+    // When a sound scheduled at t is HEARD: t plus what the audio path adds
+    // (WASAPI ~10-40 ms, Bluetooth 150-300 ms). Her mouth follows the ear.
+    const heard = () => ctx.currentTime - (ctx.outputLatency || ctx.baseLatency || 0);
 
     function draw() {
         raf = requestAnimationFrame(draw);
         if (!ctx) return;
-        const now = ctx.currentTime;
+        const now = heard();
         let show = null;
         while (frames.length && frames[0].t <= now) {
             if (show) show.bmp.close();
@@ -26,7 +30,8 @@ function createPlayer(canvas) {
     }
 
     function flush() {                  // she was stopped: cut what's scheduled
-        const now = ctx.currentTime;
+        gen++;                          // frames still decoding belong to what was cut
+        const now = heard();
         sources.forEach(s => { try { s.stop(); } catch {} });
         sources = [];
         frames = frames.filter(f => (f.t <= now) || (f.bmp.close(), false));
@@ -51,11 +56,12 @@ function createPlayer(canvas) {
         }
         let p = off + head.audio;
         if (document.hidden) return;        // a background tab: her voice plays on, frames nobody can see are not decoded
+        const g = gen;
         head.frames.forEach((len, i) => {
             const blob = new Blob([bytes.subarray(p, p + len)], { type: 'image/jpeg' });
             p += len;
             createImageBitmap(blob).then(bmp => {
-                if (!ctx) return bmp.close();      // stopped while it decoded
+                if (!ctx || g !== gen) return bmp.close();      // stopped or flushed while it decoded
                 frames.push({ t: t + i / head.fps, bmp });
                 frames.sort((a, b) => a.t - b.t);
             });
@@ -67,7 +73,8 @@ function createPlayer(canvas) {
         next = 0;
         abort = new AbortController();
         raf = requestAnimationFrame(draw);
-        const r = await fetch(`${BASE}/stream`, { signal: abort.signal });
+        const lat = (ctx.baseLatency || 0) + (ctx.outputLatency || 0);     // for her log: Bluetooth shows here
+        const r = await fetch(`${BASE}/stream?lat=${lat.toFixed(3)}`, { signal: abort.signal });
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
         const reader = r.body.getReader();
         let buf = new Uint8Array(0);

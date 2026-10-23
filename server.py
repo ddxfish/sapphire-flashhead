@@ -25,6 +25,8 @@ on 127.0.0.1 with no key. The same calls serve both:
   POST /speak?take=1    raw audio (any format PyAV reads), mouthed while anyone watches;
                         {"taken": true} only when asked to take it and a viewer plays sound
   POST /flush           she was stopped: drop what is queued
+  POST /end             her reply is over: its last words go out now (until then a
+                        gap in her words holds the face, it never idles mid-reply)
   GET  /stream?audio=0  packets: >I header length, JSON header, s16 PCM, JPEG frames;
                         audio=0 = a viewer that shows frames only (her screens)
 """
@@ -83,6 +85,7 @@ W2V = MODELS / "wav2vec2-base-960h"
 PLAY_SR = 24000          # Kokoro's native rate; what the viewer hears
 LEAD = 0.5               # seconds rendered ahead of the wall clock (at least 1.5 renders: see _pick)
 VIEWER_QUEUE = 8
+HOLD_S = 4.0             # mid-reply, her face waits this long for her next words before it idles
 BEAT = [0.0]             # when the render loop last came round: /speak takes no words from a stalled one
 
 _state = {"status": "starting", "error": None, "progress": None,
@@ -126,9 +129,20 @@ class Session:
         self.gen = 0                # bumped by a flush: a chunk rendered before it is never sent after it
         self.build = None           # her calm loop being made, a chunk per turn
         self.fails = 0              # renders failed in a row, this session's alone
+        self.open = False           # a reply is coming in (/speak), until /end, a flush or HOLD_S of quiet
+        self.heard = 0.0            # when her words last came
+        self.lead = 0.0             # how far ahead of her viewers' clock the last pick was
+        self.run = None             # this speech run's numbers, logged in one line when it ends
+        self.drops = 0              # packets a slow viewer lost, all time
 
     def talking(self):
         return not self.speech.empty() or len(self.pending["a16"]) > 0
+
+    def held(self):
+        """Mid-reply with nothing whole to say yet: she waits as she is. A
+        padded tail and a calm-loop chunk here broke her motion (reset, ~2 s
+        to settle) in the middle of a long reply on a GPU near real time."""
+        return self.open and self.speech.empty() and time.monotonic() - self.heard < HOLD_S
 
 
 def _session(name, door=False):
@@ -533,11 +547,16 @@ def _next_chunk(s):
         pass
     with s.lock:
         if len(s.pending["a16"]):
-            a16 = np.pad(s.pending["a16"], (0, P["n16"] - len(s.pending["a16"])))
-            a24 = np.pad(s.pending["a24"], (0, P["n24"] - len(s.pending["a24"])))
+            a16, a24 = _fit(s.pending["a16"], P["n16"]), _fit(s.pending["a24"], P["n24"])
             s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
             return "speech", a16, a24
     return "idle", np.zeros(P["n16"], np.float32), None
+
+
+def _fit(a, n):
+    """Exactly n samples: the tail cut or padded with silence (the two
+    resamplers can end a sample apart, and a negative pad threw every turn)."""
+    return np.pad(a[:n], (0, max(0, n - len(a))))
 
 
 def _jpeg(f):
@@ -571,6 +590,7 @@ def _flush(s):
     head = json.dumps({"kind": "flush"}).encode()
     with s.lock:
         s.gen += 1
+        s.open = False
         _drain(s)
         s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
         _broadcast(s, struct.pack(">I", len(head)) + head)
@@ -584,6 +604,7 @@ def _broadcast(s, pkt):
             try:
                 q.put_nowait(pkt)
             except queue.Full:
+                s.drops += 1
                 with contextlib.suppress(queue.Empty, queue.Full):
                     q.get_nowait()
                     q.put_nowait(pkt)
@@ -620,9 +641,16 @@ def _pick():
                 s.clock = [now, 0.0]
             lead = s.clock[1] - (now - s.clock[0])
             if lead < -2.0:                         # fell behind (GPU busy): rebase
+                if s.run:
+                    s.run["rebases"] += 1
                 s.clock, lead = [now, 0.0], 0.0
             if lead > ahead:
                 continue
+            if s.held():
+                if s.run and not s.run["waiting"]:
+                    s.run["waits"], s.run["waiting"] = s.run["waits"] + 1, True
+                continue
+            s.lead = lead
             rank = 0 if s.talking() else 2 if _idle_mode(s) == "live" else 1
             if best is None or (rank, lead) < best[0]:
                 best = ((rank, lead), s)
@@ -658,6 +686,9 @@ def _turn():
     except Exception:
         logger.exception(f"Face not taken ({s.name})")
         s.want = None                       # never retried in a loop; her next reply sends it again
+        with s.lock:                        # words taken while the face was coming still play, without one
+            for _, rest in _drain(s):
+                _out.put((s, s.gen, "speech", [], rest, None))
         return
     if not s.face:                          # never animate the grey warm-up card
         time.sleep(0.05)
@@ -666,6 +697,8 @@ def _turn():
     gen, t = s.gen, time.perf_counter()
     try:
         pkt = None
+        if kind == "idle" and s.run:
+            _run_end(s)
         if kind == "idle" and _idle_mode(s) == "live":
             frames = _render(s, a16)            # she sits as the model has her; her next words go on from here
             _home(s)
@@ -674,12 +707,18 @@ def _turn():
             frames, pkt = _idle_step(s)
             s.live = False
         else:
+            r = s.run = s.run or {"n": 0, "render": [], "lead": [], "waits": 0, "waiting": False,
+                                  "resets": 0, "rebases": 0, "drops": s.drops}
             if not s.live:
                 _reset_motion(s)
                 s.live = True
+                r["resets"] += 1
             s.build = None                      # her motion moved on: a calm loop half made starts again
             frames = _render(s, a16)
-            logger.info(f"speech chunk rendered in {time.perf_counter() - t:.3f}s ({s.name})")
+            r["n"] += 1
+            r["render"].append(time.perf_counter() - t)
+            r["lead"].append(s.lead)
+            r["waiting"] = False
     except Exception as e:
         logger.exception(f"Render failed ({s.name})")
         if a24 is not None:
@@ -699,6 +738,21 @@ def _turn():
     c = s.clock                             # a viewer leaving may clear it meanwhile
     if c:
         c[1] += P["chunk_s"]
+
+
+def _run_end(s):
+    """One line per speech run, numbers only (never her words): enough to
+    tell a slow GPU (render near chunk_s, lead below 0, rebases) from her
+    words arriving late (waits) from a slow viewer (drops) from a reset in
+    the middle of a reply (resets > 1)."""
+    r, s.run = s.run, None
+    if not r or not r["n"]:
+        return
+    rd, ld = r["render"], r["lead"]
+    logger.info(f"speech run ({s.name}): {r['n']} chunks ({r['n'] * P['chunk_s']:.1f}s), "
+                f"render {min(rd):.2f}/{sum(rd) / len(rd):.2f}/{max(rd):.2f}s for {P['chunk_s']:.2f}s, "
+                f"lead {min(ld):+.2f}..{max(ld):+.2f}s, waits {r['waits']}, resets {r['resets']}, "
+                f"rebases {r['rebases']}, drops {s.drops - r['drops']}")
 
 
 def _inside(path):
@@ -774,7 +828,11 @@ class Handler(BaseHTTPRequestHandler):
         with _viewers_lock:
             s.viewers[q] = parse_qs(url.query).get("audio", ["1"])[0] != "0"
             _watching.set()
-        logger.info(f"Viewer joined ({s.name}: {len(s.viewers)})")
+        try:                                     # what the browser says its audio path adds (Bluetooth: 0.15-0.3 s)
+            lat = f", audio out {float(parse_qs(url.query)['lat'][0]):.3f}s"
+        except (KeyError, ValueError, IndexError):
+            lat = ""
+        logger.info(f"Viewer joined ({s.name}: {len(s.viewers)}{lat})")
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -806,7 +864,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not any(x.viewers for x in _sessions.values()):
                     _watching.clear()
             if last:
+                if s.run:
+                    _run_end(s)
                 with s.lock:                     # nobody to hear it: no old sentence waits for the next viewer
+                    s.open = False
                     _drain(s)
                     s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
             if gone:
@@ -840,14 +901,24 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/flush":
             _flush(s)
             return self._json({"ok": True})
+        if url.path == "/end":
+            s.open = False                       # her last words go out now, then she idles
+            return self._json({"ok": True})
         if url.path == "/speak":
-            if (_state["status"] != "ready" or not s.viewers or not s.face or not s.want
-                    or time.monotonic() - BEAT[0] > 15):   # no face to give, or the loop stalled: she speaks at home
-                return self._json({"taken": False})
+            # A face still coming (want, not yet applied) takes her words too: the
+            # render loop applies it first. Refusing them split her first reply
+            # after Watch between this panel and her own speakers.
+            why = ("not ready" if _state["status"] != "ready" else "no viewer" if not s.viewers
+                   else "no face" if not s.want or not (s.face or os.path.exists(s.want))
+                   else "stalled" if time.monotonic() - BEAT[0] > 15 else "")
+            if why:                              # no face to give, or the loop stalled: she speaks at home
+                return self._json({"taken": False, "why": why})
             try:
                 _queue_speech(s, data)
+                s.open, s.heard = True, time.monotonic()
                 take = query.get("take", ["0"])[0] == "1"
-                return self._json({"taken": take and any(s.viewers.values())})
+                taken = take and any(s.viewers.values())
+                return self._json({"taken": taken, "why": "" if taken else "no listener" if take else "a device plays it"})
             except Exception as e:
                 logger.warning(f"Speak decode failed ({s.name}): {e}")
                 return self._json({"taken": False, "error": str(e)})

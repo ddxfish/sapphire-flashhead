@@ -4,13 +4,17 @@ stream start: pick the face for her current mood and wake her screens. Each
 chunk: handed to the server so the face mouths it; the audio is taken (not
 played here) only on a lane that plays here and while a viewer plays sound,
 so a closed panel never mutes her and a board's voice is never stolen.
-Stop: flush what's queued so the face stops when she does.
+Stop: flush what's queued so the face stops when she does; a reply that
+ends tells the server so (/end), so a gap between her sentences holds the face
+instead of idling it. One line per reply says where her words went.
 Only while the server was last seen ready: a stopped or loading service costs
 her voice nothing (looked at again at most every 10 s). The server is this
 computer's, or in client mode a worker elsewhere (faces.http()).
 """
 import logging
 import time
+
+import requests
 
 from plugins.flashhead import faces
 
@@ -19,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _ready = {"ok": False, "at": 0.0}
 RECHECK_S = 10
+_tally = {}              # stream_id -> {"face": n, "here": {why: n}, "slow": ms}: one log line per reply
 
 
 def _post(path, timeout=2, **kw):
@@ -55,24 +60,49 @@ def tts_stream_start(event):
 
 
 def tts_chunk_audio(event):
-    audio = (event.metadata or {}).get("audio") or {}
+    meta = event.metadata or {}
+    audio = meta.get("audio") or {}
     data = audio.get("audio_bytes")
     if not data or not _ready["ok"]:
         return
-    here = (event.metadata or {}).get("plays_here", True)      # False: it is a device's voice, never ours to take
+    if len(_tally) > 32:                         # a stream that never ended: forget, never grow
+        _tally.clear()
+    t = _tally.setdefault(meta.get("stream_id"), {"face": 0, "here": {}, "slow": 0})
+    here = meta.get("plays_here", True)      # False: it is a device's voice, never ours to take
+    t0 = time.monotonic()
     try:
         r = _post(f"/speak?take={int(here)}", data=data, headers={"Content-Type": audio.get("content_type", "audio/ogg")})
-        event.skip_tts = bool(here and r.ok and r.json().get("taken"))
+        ans = r.json() if r.ok else {"why": f"HTTP {r.status_code}"}
+        event.skip_tts = bool(here and ans.get("taken"))
+        why = "" if event.skip_tts else ans.get("why") or "refused"
+    except requests.exceptions.ReadTimeout:
+        # It got there and is (almost surely) queued: playing it here too was
+        # the double voice, and dropping the server for the rest of the reply
+        # sent every later sentence home without a face (Teri, 2026-10-23).
+        event.skip_tts, why = bool(here), ""
+        logger.warning(f"[flashhead] /speak slow (over {time.monotonic() - t0:.1f}s): left to the face")
     except Exception as e:
-        _ready["ok"] = False                     # gone mid-reply: the next reply looks again
+        _ready["ok"] = False                     # never reached it: gone mid-reply, the next reply looks again
         faces.forget()
-        logger.debug(f"[flashhead] server not taking audio: {e}")
+        why = type(e).__name__
+        logger.warning(f"[flashhead] server not taking her voice ({why}): it plays here")
+    t["slow"] = max(t["slow"], int((time.monotonic() - t0) * 1000))
+    if event.skip_tts:
+        t["face"] += 1
+    else:
+        t["here"][why] = t["here"].get(why, 0) + 1
 
 
 def tts_stream_end(event):
-    if not (event.metadata or {}).get("interrupted") or not _ready["ok"]:
+    meta = event.metadata or {}
+    t = _tally.pop(meta.get("stream_id"), None)
+    if t and (t["face"] or set(t["here"]) - {"no viewer", "a device plays it"}):   # the panel closed: nothing to say
+        here = ", ".join(f"{n} {w}" for w, n in t["here"].items())
+        logger.info(f"[flashhead] reply: {t['face']} to the face, {sum(t['here'].values())} played here"
+                    + (f" ({here})" if here else "") + f", slowest /speak {t['slow']} ms")
+    if not _ready["ok"]:
         return
     try:
-        _post("/flush", timeout=1)
+        _post("/flush" if meta.get("interrupted") else "/end", timeout=1)
     except Exception:
         pass
