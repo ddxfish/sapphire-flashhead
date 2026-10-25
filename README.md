@@ -45,6 +45,10 @@ One computer's FlashHead can give every Sapphire on your network her own live fa
 
 The other computer's port (5018 by default) must be reachable on your network. Traffic is TLS, pinned to that computer's own certificate (no certificate authority, so a changed address still works and a different server never does), with a key per computer; removing a computer shuts it out. Her voice goes there and comes back with her face, which is what keeps her lips in time. Her words always go first: when two talk at the same moment, both keep up on a fast card; on a slower one (a 5060 Ti) the second plays her voice without a face until the first is done.
 
+## Her face on another screen
+
+`viewer/` is a standalone window for her face and voice on any computer that reaches your Sapphire (a Raspberry Pi on a screen): an API key, her address, `--fullscreen`, `--mute`. Its own `requirements.txt`, nothing of Sapphire's. See `viewer/README.md`.
+
 ## How fast is this GPU?
 
 `./flashhead-bench.sh` or `flashhead-bench.bat` (in the env that renders; inside Sapphire set `FLASHHEAD_ENV=sapphire-plugin-flashhead`) loads the model the way the server does, once per variant, and times real chunks: 0.96 s of speech in, 24 frames out. Variants: `eager`, `compiled`, `sdpa`, `autotune`, and the experiments `steps2`, `fp16acc`, `decode25`. `--face` and `--audio` give a picture and a recording for a strip of frames per variant (quality is for eyes, not timers); `--long 180` lets her run on for 3 minutes and reports whether her face drifts. Results land in `user/models/flashhead/bench/`. It never downloads; run the server once first.

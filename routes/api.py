@@ -47,6 +47,8 @@ async def stream(settings=None, query=None, **_):
             lat = f"?lat={float((query or {}).get('lat') or 0):.3f}"
         except (TypeError, ValueError):
             lat = ""
+        if (query or {}).get("audio") == "0":   # a face only: her voice stays where it plays now
+            lat = f"{lat or '?'}{'&' if lat else ''}audio=0"
         resp = await client.send(client.build_request("GET", f"{base}/stream{lat}"), stream=True)
     except Exception as e:
         await client.aclose()
