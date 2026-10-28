@@ -45,6 +45,30 @@ One computer's FlashHead can give every Sapphire on your network her own live fa
 
 The other computer's port (5018 by default) must be reachable on your network. Traffic is TLS, pinned to that computer's own certificate (no certificate authority, so a changed address still works and a different server never does), with a key per computer; removing a computer shuts it out. Her voice goes there and comes back with her face, which is what keeps her lips in time. Her words always go first: when two talk at the same moment, both keep up on a fast card; on a slower one (a 5060 Ti) the second plays her voice without a face until the first is done.
 
+## Her face as a webcam
+
+Her live face as a camera, and her voice as a mic, that a call or stream can pick (Zoom, Meet, Discord, OBS). It works on the computer running Sapphire, client mode included.
+
+**Windows**
+
+1. Install **OBS Studio 26 or newer** (obsproject.com). Her camera is OBS's virtual camera; OBS doesn't need to be running. Keep OBS's own *Start Virtual Camera* off, since only one program can drive it.
+2. For her voice: install **VB-Cable** (free, vb-audio.com/Cable), run its setup as administrator, then reboot.
+3. Settings › Plugins › FlashHead card: **Install** the webcam packages (pyvirtualcam).
+4. Settings › FlashHead › **Webcam**: turn on *Her face as a webcam*, and *Her voice as a mic* if you want her voice too. Leave *Camera device* and *Mic device* empty. Save.
+5. In the call, pick **OBS Virtual Camera** as the camera and **CABLE Output** as the mic.
+
+**Linux**
+
+1. Install v4l2loopback (`sudo apt install v4l2loopback-dkms` on Ubuntu) and load it:
+   `sudo modprobe v4l2loopback exclusive_caps=1 card_label="Sapphire Cam"`
+   To load it at every boot, put `v4l2loopback` in `/etc/modules-load.d/v4l2loopback.conf` and the options in `/etc/modprobe.d/v4l2loopback.conf` (`options v4l2loopback exclusive_caps=1 card_label="Sapphire Cam"`).
+2. For her voice: PipeWire (Ubuntu's default) with `pw-cat`. Nothing else to install.
+3. Settings › Plugins › FlashHead card: **Install** the webcam packages (pyvirtualcam).
+4. Settings › FlashHead › **Webcam**: turn on *Her face as a webcam* and, if you want, *Her voice as a mic*. *Camera device* empty takes the first free loopback device; name one (`/dev/video3`) if you have several. Save.
+5. In the call, pick **Sapphire Cam** as the camera and **Sapphire Voice** as the mic.
+
+While the webcam is on, her face renders all the time: cheap with the calm loop, but with *Live* the GPU stays busy. With *Her voice as a mic* on, her voice goes only to the call; turn on *Hear her here too* to also hear her on this computer's speakers. If something's missing, the Webcam tab says what to install.
+
 ## Her face on another screen
 
 `viewer/` is a standalone window for her face and voice on any computer that reaches your Sapphire (a Raspberry Pi on a screen): an API key, her address, `--fullscreen`, `--mute`. Its own `requirements.txt`, nothing of Sapphire's. See `viewer/README.md`.

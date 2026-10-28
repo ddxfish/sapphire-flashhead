@@ -1,4 +1,4 @@
-"""FlashHead routes — status, the live stream door, faces and moods."""
+"""FlashHead routes — status, the live stream door, faces and moods, the webcam."""
 import asyncio
 import io
 import logging
@@ -162,3 +162,17 @@ def models(settings=None, **_):
         parts.append({"name": name, "present": d.is_dir() and size > 0, "gb": round(size / 1e9, 2)})
     return {"folder": str(folder), "custom": bool(str(settings.get("models_dir") or "").strip()) if settings else False,
             "parts": parts}
+
+
+def camera_status(**_):
+    """Her webcam: off | on | error, its device and mic, why not in words."""
+    from plugins.flashhead import camera
+    from core import extras
+    return {**camera.status(), "installed": extras.installed("plugin:flashhead")}
+
+
+def camera_retry(**_):
+    """After an install, or a camera freed elsewhere: try again now."""
+    from plugins.flashhead import camera
+    camera.on_settings_saved(None)
+    return {"ok": True}

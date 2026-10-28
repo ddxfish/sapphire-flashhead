@@ -161,6 +161,49 @@ async function openSettings() {
     switchView('settings');
 }
 
+// The app page: type words (or hold 🎤 and say them: they land in the box,
+// never sent), and she speaks them with no LLM between (/api/tts/stream). Her
+// face takes them while someone watches, so Speak starts Watch first.
+function mountSay(root, watchFirst) {
+    const words = root.querySelector('.fh-words'), mic = root.querySelector('.fh-mic'), speak = root.querySelector('.fh-speak');
+    const audio = () => import('/static/audio.js');
+    const add = text => {
+        words.value = words.value.trim() ? `${words.value.trimEnd()} ${text}` : text;
+        words.focus();
+    };
+    let held = false;                   // a release before the mic opened still stops it
+    const lit = on => { mic.style.outline = on ? '2px solid var(--accent-red,#e55)' : ''; };
+    mic.onpointerdown = async e => {
+        e.preventDefault();
+        held = true;
+        lit(true);
+        const a = await audio();
+        await a.handlePress(mic);
+        if (!held) a.handleRelease(mic, add);
+    };
+    mic.onpointerup = mic.onpointerleave = mic.onpointercancel = async () => {
+        if (!held) return;
+        held = false;
+        lit(false);
+        (await audio()).handleRelease(mic, add);
+    };
+    async function say() {
+        const text = words.value.trim();
+        if (!text || speak.disabled) return;
+        speak.disabled = true;
+        try {
+            watchFirst();
+            await new Promise(r => setTimeout(r, 400));     // her face is listening before her first words reach it
+            const a = await audio();
+            if (!await a.playTextStreaming(text)) await a.playText(text);
+        } catch (e) {
+            root.querySelector('.fh-status').textContent = `couldn't speak: ${e.message}`;
+        } finally { speak.disabled = false; }
+    }
+    speak.onclick = say;
+    words.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); say(); } };
+}
+
 export function mount(root, { big = false } = {}) {
     const size = big ? 'min(80vh, 90vw)' : '100%';
     root.innerHTML = `
@@ -175,6 +218,12 @@ export function mount(root, { big = false } = {}) {
                 <button class="fh-settings btn" title="Faces, moods, idle and screens">⚙</button>
             </div>
             <div class="fh-status" style="font-size:var(--font-sm,12px);color:var(--text-muted);text-align:center;"></div>
+            ${big ? `<div style="width:${size};display:flex;gap:6px;align-items:stretch;">
+                <textarea class="fh-words" rows="2" placeholder="Words for her to say (Ctrl+Enter)"
+                    style="flex:1;resize:vertical;padding:6px 8px;border-radius:var(--radius-md,8px);"></textarea>
+                <button class="fh-mic btn" title="Hold to talk: your words land in the box">🎤</button>
+                <button class="fh-speak btn">Speak</button>
+            </div>` : ''}
         </div>`;
     const $ = s => root.querySelector(s);
     const canvas = $('.fh-canvas'), still = $('.fh-still'), btn = $('.fh-watch'), status = $('.fh-status');
@@ -227,6 +276,8 @@ export function mount(root, { big = false } = {}) {
         await fetch(`${BASE}/restart`, { method: 'POST', headers: { 'X-CSRF-Token': csrf() } }).catch(() => {});
         tick();
     };
+
+    if (big) mountSay(root, () => { if (!watching) watch(); });
 
     // Only while watching: a collapsed accordion or scrolled-away face stops the GPU.
     const seen = new IntersectionObserver(([e]) => { if (!e.isIntersecting) unwatch(); });

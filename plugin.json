@@ -1,7 +1,7 @@
 {
   "name": "flashhead",
   "short_display_name": "Avatar FlashHead",
-  "version": "1.3.4",
+  "version": "1.4.0",
   "min_core_version": "2.15.3",
   "description": "Live talking face — SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
   "author": "Teri and Chris",
@@ -17,6 +17,12 @@
     "win32"
   ],
   "settingsUI": "plugin",
+  "extra": {
+    "label": "Webcam packages",
+    "pip": ["pyvirtualcam>=0.12"],
+    "modules": ["pyvirtualcam"],
+    "note": "pyvirtualcam: her face as a webcam (Settings > FlashHead > Webcam)"
+  },
   "environment": {
     "python": "3.10",
     "pip": [
@@ -107,6 +113,16 @@
         "method": "GET",
         "path": "models",
         "handler": "routes/api.py:models"
+      },
+      {
+        "method": "GET",
+        "path": "camera",
+        "handler": "routes/api.py:camera_status"
+      },
+      {
+        "method": "POST",
+        "path": "camera",
+        "handler": "routes/api.py:camera_retry"
       }
     ],
     "sidebar_accordion": {
@@ -167,6 +183,52 @@
         "default": "",
         "help": "Empty: the avatar of the persona in the chat she speaks in, so the face follows whoever is talking. A persona's name pins that one. An uploaded face (Faces tab) wins over both.",
         "placeholder": "follow the chat"
+      },
+      {
+        "key": "camera",
+        "type": "boolean",
+        "label": "Her face as a webcam",
+        "default": false,
+        "tab": "Webcam",
+        "help": "Her live face as a camera a call or a stream can pick (Zoom, Meet, Discord, OBS). Windows: the camera is OBS Studio's (install OBS 26+, keep its own Start Virtual Camera off), named OBS Virtual Camera. Linux: a v4l2loopback device. While it is on her face renders all the time: cheap with the calm loop, the GPU busy with Live."
+      },
+      {
+        "key": "camera_voice",
+        "type": "boolean",
+        "label": "Her voice as a mic",
+        "default": false,
+        "tab": "Webcam",
+        "show_if": {"camera": true},
+        "help": "Her voice goes to the call with her face, in step. Windows: needs VB-Cable (free, vb-audio.com/Cable); pick CABLE Output as the mic in the call. Linux: a mic called Sapphire Voice appears. While on, her voice plays nowhere else unless you also turn on Hear her here."
+      },
+      {
+        "key": "camera_hear",
+        "type": "boolean",
+        "label": "Hear her here too",
+        "default": true,
+        "tab": "Webcam",
+        "show_if": {"camera_voice": true},
+        "help": "Her voice on this computer's speakers as well as in the call."
+      },
+      {
+        "key": "camera_device",
+        "type": "string",
+        "label": "Camera device",
+        "default": "",
+        "tab": "Webcam",
+        "show_if": {"camera": true},
+        "placeholder": "the first free one",
+        "help": "Linux: a v4l2loopback device such as /dev/video3. Windows: leave empty."
+      },
+      {
+        "key": "camera_mic",
+        "type": "string",
+        "label": "Mic device",
+        "default": "",
+        "tab": "Webcam",
+        "show_if": {"camera_voice": true},
+        "placeholder": "CABLE Input (Windows), Sapphire Voice (Linux)",
+        "help": "An output device her voice is played into for the call (part of its name is enough). Empty: VB-Cable's CABLE Input on Windows, a PipeWire mic of her own on Linux."
       },
       {
         "key": "client",
@@ -231,7 +293,7 @@
       }
     ],
     "daemon": {
-      "entry": "screens.py"
+      "entry": "daemon.py"
     }
   }
 }

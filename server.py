@@ -31,7 +31,9 @@ on 127.0.0.1 with no key. The same calls serve both:
                         gap in her words holds the face, it never idles mid-reply)
   GET  /stream?audio=0  packets: >I header length, JSON header, s16 PCM, JPEG frames;
                         audio=0 = a viewer that shows frames only (her screens); of the
-                        others the newest plays her voice, the rest get packets without it
+                        others the newest plays her voice, the rest get packets without it;
+                        call=1 = her webcam carrying her voice into a call: it keeps her
+                        voice while it watches, a browser opened meanwhile mouths silently
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import contextlib
@@ -126,6 +128,7 @@ class Session:
         self.lock = threading.Lock()
         self.viewers = {}           # queue -> plays the sound (a browser) or frames only (a board)
         self.voice = None           # the one viewer that plays her voice (the newest browser): two would echo
+        self.call = None            # her webcam's viewer with her voice: it keeps s.voice while it watches
         self.idle = {"key": None, "packets": [], "at": 0}
         self.live = False           # her motion runs on from the last chunk; False: speech starts her afresh
         self.clock = None           # [t0, seconds made] while watched
@@ -860,9 +863,12 @@ class Handler(BaseHTTPRequestHandler):
         if url.path != "/stream":
             return self._json({"error": "not found"}, 404)
         q = queue.Queue(maxsize=VIEWER_QUEUE)
+        args = parse_qs(url.query)
         with _viewers_lock:
-            s.viewers[q] = parse_qs(url.query).get("audio", ["1"])[0] != "0"
-            if s.viewers[q]:
+            s.viewers[q] = args.get("audio", ["1"])[0] != "0"
+            if s.viewers[q] and args.get("call", ["0"])[0] == "1":
+                s.call = s.voice = q             # a call hears her: a browser opened mid-call never takes her voice from it
+            elif s.viewers[q] and s.call is None:
                 s.voice = q                      # the newest browser plays her voice; any other mouths it silently
             _watching.set()
         try:                                     # what the browser says its audio path adds (Bluetooth: 0.15-0.3 s)
@@ -894,6 +900,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _viewers_lock:
                 s.viewers.pop(q, None)
+                if s.call is q:
+                    s.call = None
                 if s.voice is q:
                     s.voice = next((v for v, sound in s.viewers.items() if sound), None)
                 last = not s.viewers

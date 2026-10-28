@@ -125,6 +125,36 @@ async function mountModels(el) {
     } catch { el.querySelector('.fh-folder').textContent = 'unknown'; }
 }
 
+// Webcam: what her camera is doing now, in words, and the packages it needs.
+function mountWebcam(el) {
+    el.innerHTML = `<div style="margin-top:6px;display:flex;flex-direction:column;gap:8px;">
+        <div class="fh-cam" style="font-size:var(--font-sm,12px);"></div>
+        <div style="display:flex;gap:6px;">
+            <button class="btn fh-cam-install" hidden>Install webcam packages</button>
+            <button class="btn fh-cam-retry" hidden>↻ Try again</button>
+        </div></div>`;
+    const $ = s => el.querySelector(s);
+    const retry = () => fetch(`${BASE}/camera`, { method: 'POST', headers: { 'X-CSRF-Token': csrf() } });
+    async function tick() {
+        if (!el.isConnected) return clearInterval(poll);
+        try {
+            const c = await (await fetch(`${BASE}/camera`)).json();
+            $('.fh-cam').textContent = c.status === 'on'
+                ? `On: camera ${c.device}${c.mic ? `, her voice on ${c.mic}` : ', no voice'}`
+                : c.status === 'error' ? c.error : 'Off';
+            $('.fh-cam-install').hidden = c.installed;
+            $('.fh-cam-retry').hidden = !(c.installed && c.status === 'error');
+        } catch { $('.fh-cam').textContent = 'status unavailable'; }
+    }
+    $('.fh-cam-install').onclick = async () => {
+        const { ensureExtra } = await import('/static/shared/extras.js');
+        if (await ensureExtra('plugin:flashhead')) { await retry(); tick(); }
+    };
+    $('.fh-cam-retry').onclick = async () => { await retry(); setTimeout(tick, 1500); };
+    const poll = setInterval(tick, 3000);
+    tick();
+}
+
 const RESTARTS = ['port', 'models_dir', 'install_test', 'share', 'share_port'];      // read once at service start: a change restarts it
 
 export default {
@@ -136,7 +166,7 @@ export default {
             id: 'flashhead',
             name: 'FlashHead',
             icon: '🗣️',
-            helpText: 'Her live face: idle, screens, faces and moods',
+            helpText: 'Her live face: idle, screens, faces and moods, webcam',
             async load() {
                 fields = await schema();
                 saved = await pluginsAPI.getSettings('flashhead');
@@ -144,7 +174,8 @@ export default {
             },
             render: (container, settings) =>
                 renderSettingsForm(container, fields, settings,
-                    { slots: [{ tab: 'Faces', mount: mountFaces }, { tab: 'Advanced', mount: el => mountAdvanced(el, saved.share === true) }] }),
+                    { slots: [{ tab: 'Faces', mount: mountFaces }, { tab: 'Webcam', mount: mountWebcam },
+                             { tab: 'Advanced', mount: el => mountAdvanced(el, saved.share === true) }] }),
             async save(s) {
                 const out = await pluginsAPI.saveSettings('flashhead', s);
                 const restart = RESTARTS.some(k => String(s[k] ?? '') !== String(saved[k] ?? ''));
