@@ -21,7 +21,8 @@ on 127.0.0.1 with no key. The same calls serve both:
 
   GET  /health          status, this session's viewers
   POST /face?idle=      {"path": image} (local only) or the image itself
-                        (Content-Type image/*) - animate this face; idle=loop|live
+                        (Content-Type image/*) - animate this face; idle=loop|live|light;
+                        soon=1: her words are on their way (a live idle leaves the GPU to her voice)
   POST /speak?take=1    raw audio (any format PyAV reads), mouthed while anyone watches;
        &device=        {"taken": true} only when asked to take it and a browser or a call plays
                         sound (a board stream is not a listener); not taken, browsers get it
@@ -110,6 +111,8 @@ _watching = threading.Event()    # anyone, in any session
 _pipe = None
 P = {}                   # chunk geometry, filled after the model loads
 IDLE_CHUNKS, IDLE_SETTLE, IDLE_KEEP = 14, 3, 5   # loop mode: render 14 silent chunks, skip the 3 that settle, keep the calmest 5
+SOON_S = 6.0             # a live idle renders nothing this long after a reply starts (/face?soon=1), or until her first words: the GPU is her voice's
+LIVE = ("live", "light")  # idle rendered as she sits; light: each frame shown twice, half the renders
 HOME = 0.25              # live idle: how much of her picture goes back into the motion she continues from, each quiet chunk
 SETTINGS = ROOT / "user" / "webui" / "plugins" / "flashhead.json"
 FACES = ROOT / "user" / "models" / "flashhead" / "faces"     # faces other computers sent: copies, rebuildable
@@ -137,7 +140,7 @@ class Session:
         self.face = None            # file@mtime of the face taken
         self.t = None               # (colour reference, reference latent, motion latent) on the GPU
         self.dq = None              # her last seconds of audio: the model's window
-        self.mode = None            # idle "loop" | "live" as her Sapphire asked; None: this computer's setting
+        self.mode = None            # idle "loop" | "live" | "light" as her Sapphire asked; None: this computer's setting
         self.speech = queue.Queue()
         self.pending = {"a16": np.zeros(0, np.float32), "a24": np.zeros(0, np.int16), "tag": None}
         self.lock = threading.Lock()
@@ -146,6 +149,9 @@ class Session:
         self.voice = None           # the one viewer that plays her voice (the newest browser): two would echo
         self.call = None            # her webcam's viewer with her voice: it keeps s.voice while it watches
         self.idle = {"key": None, "packets": [], "at": 0}
+        self.rest = []              # live idle: frames to show before the next render (light's second half, her last second rocked while her words come)
+        self.last = None            # live idle: the frames last shown that end where her motion is
+        self.soon = 0.0             # when a reply last started (/face?soon=1)
         self.live = False           # her motion runs on from the last chunk; False: speech starts her afresh
         self.clock = None           # [t0, seconds made] while watched
         self.note = None
@@ -156,6 +162,7 @@ class Session:
         self.heard = 0.0            # when her words last came
         self.lead = 0.0             # how far ahead of her viewers' clock the last pick was
         self.run = None             # this speech run's numbers, logged in one line when it ends
+        self.now_tag = None         # the tag of the chunk being rendered: a flush by sid knows whether that one goes too
         self.drops = 0              # packets a slow viewer lost, all time
 
     def talking(self):
@@ -512,7 +519,7 @@ def _apply_face(s):
         P["fh"].get_base_data(_pipe, cond_image_path_or_dir=path, base_seed=42, use_face_crop=False)
         s.t = (_pipe.original_color_reference, _pipe.ref_img_latent, _pipe.latent_motion_frames)
         s.dq = np.zeros(P["cache"], np.float32)
-    s.face, s.live = key, False
+    s.face, s.live, s.rest, s.last = key, False, [], None
     logger.info(f"Face set ({s.name})")
 
 
@@ -537,10 +544,11 @@ def _home(s):
 
 
 def _idle_mode(s):
-    """'loop' (rendered once, the GPU rests) or 'live' (rendered as she sits,
-    the GPU works while anyone watches): as her Sapphire asked, else this
+    """'loop' (rendered once, the GPU rests), 'live' (rendered as she sits,
+    the GPU works while anyone watches) or 'light' (live at half speed, half
+    the renders): as her Sapphire asked, else this
     computer's setting, read again when it changes."""
-    if s.mode in ("loop", "live"):
+    if s.mode in ("loop", *LIVE):
         return s.mode
     try:
         m = SETTINGS.stat().st_mtime
@@ -700,16 +708,41 @@ def _drain(s):
             return out
 
 
-def _flush(s):
+def _flush(s, sid=None):
     """Stop: drop queued speech here and tell viewers to drop what they
-    scheduled. The chunk being rendered right now is dropped too (gen)."""
+    scheduled. The chunk being rendered right now is dropped too (gen).
+    `sid`: that reply (core's stream id) and no other's: a board's stop
+    flushed everything, another chat's reply with it (scouts 2026-11-05).
+    Returns how many slices went."""
     head = json.dumps({"kind": "flush"}).encode()
     with s.lock:
-        s.gen += 1
-        s.open = False
-        _drain(s)
-        s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
+        if sid:
+            kept, dropped = [], 0
+            for item in _drain(s):
+                if (item[2] or {}).get("sid") == sid:
+                    dropped += 1
+                else:
+                    kept.append(item)
+            for item in kept:
+                s.speech.put(item)
+            if (s.pending.get("tag") or {}).get("sid") == sid and len(s.pending["a16"]):
+                s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
+                dropped += 1
+            if (s.now_tag or {}).get("sid") == sid:
+                s.gen += 1
+                dropped += 1
+            if not dropped:
+                return 0                             # nothing of that reply here: the viewers are not jolted
+            if not kept and not len(s.pending["a16"]):
+                s.open = False
+        else:
+            dropped = s.speech.qsize() + (1 if len(s.pending["a16"]) else 0) + (1 if s.now_tag else 0)
+            s.gen += 1
+            s.open = False
+            _drain(s)
+            s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
         _broadcast(s, struct.pack(">I", len(head)) + head)
+    return dropped
 
 
 def _broadcast(s, pkt, quiet=None, hush=None):
@@ -787,7 +820,7 @@ def _pick():
                     s.run["waits"], s.run["waiting"] = s.run["waits"] + 1, True
                 continue
             s.lead = lead
-            rank = 0 if s.talking() else 2 if _idle_mode(s) == "live" else 1
+            rank = 0 if s.talking() else 2 if _idle_mode(s) in LIVE else 1
             if best is None or (rank, lead) < best[0]:
                 best = ((rank, lead), s)
     return best and best[1]
@@ -830,18 +863,29 @@ def _turn():
         time.sleep(0.05)
         return
     kind, a16, a24, tag = _next_chunk(s)
+    s.now_tag = tag if kind == "speech" else None
     gen, t = s.gen, time.perf_counter()
     try:
         pkt = None
         if kind == "idle" and s.run:
             _run_end(s)
-        if kind == "idle" and _idle_mode(s) == "live":
-            frames = _render(s, a16)            # she sits as the model has her; her next words go on from here
-            _home(s)
+        mode = _idle_mode(s) if kind == "idle" else None
+        if mode in LIVE:
+            if not s.rest and s.last is not None and time.monotonic() - s.soon < SOON_S:
+                s.rest = [s.last[::-1], s.last]     # her words are on their way: no render now, she rocks on her last second
+            if s.rest:
+                frames = s.rest.pop(0)
+            else:
+                frames = s.last = _render(s, a16)   # she sits as the model has her; her next words go on from here
+                _home(s)
+                if mode == "light":                 # each frame twice: two chunks shown per render
+                    two = np.repeat(frames, 2, axis=0)
+                    frames, s.rest = two[:len(frames)], [two[len(frames):]]
+                    s.last = s.rest[0]
             s.live, s.build = True, None
         elif kind == "idle":
             frames, pkt = _idle_step(s)
-            s.live = False
+            s.live, s.rest, s.last = False, [], None
         else:
             r = s.run = s.run or {"n": 0, "render": [], "lead": [], "waits": 0, "waiting": False,
                                   "resets": 0, "rebases": 0, "drops": s.drops}
@@ -850,6 +894,7 @@ def _turn():
                 s.live = True
                 r["resets"] += 1
             s.build = None                      # her motion moved on: a calm loop half made starts again
+            s.rest, s.last, s.soon = [], None, 0.0
             frames = _render(s, a16)
             r["n"] += 1
             r["render"].append(time.perf_counter() - t)
@@ -933,6 +978,8 @@ def _face_bytes(s, data):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30                 # the socket's: a viewer that vanished without a FIN (a phone locked) held her voice slot until TCP gave up (scouts 2026-11-05)
+
     def _caller(self, post=False):
         """The session a request speaks for, or None (refused, and answered).
         Through the shared door: the computer its key names. Here on
@@ -1058,16 +1105,18 @@ class Handler(BaseHTTPRequestHandler):
                     if not _inside(path):
                         return self._json({"error": "a face must be inside Sapphire's folder"}, 400)
                 s.want = path
-                if query.get("idle", [""])[0] in ("loop", "live"):
+                if query.get("idle", [""])[0] in ("loop", *LIVE):
                     s.mode = query["idle"][0]
+                if query.get("soon"):
+                    s.soon = time.monotonic()
                 return self._json({"ok": True})
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
         if url.path == "/flush":
-            _flush(s)
+            dropped = _flush(s, sid=query.get("sid", [""])[0][:64] or None)   # sid=: that reply alone (a board's stop, a reply cut at core)
             if query.get("by"):                  # a tap on her face, not core's own stop: said beside the run's line
                 logger.info(f"Stopped from the {query['by'][0][:24]} ({s.name})")
-            return self._json({"ok": True})
+            return self._json({"ok": True, "dropped": dropped})
         if url.path == "/viewer":
             _viewer_log(s, data)
             return self._json({"ok": True})

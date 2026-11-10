@@ -45,24 +45,29 @@ def _server_ready():
     return _ready["ok"]
 
 
+def _sealed_away(event):
+    """A private chat's words never leave this computer: with a worker elsewhere (client mode) her
+    voice and face stay home for that turn (privacy_aware is a promise, not a flag; scouts 2026-11-05)."""
+    return bool(getattr(event, "chat_private", None)) and bool(faces.worker())
+
+
 def tts_stream_start(event):
-    if not _server_ready():
+    if not _server_ready() or _sealed_away(event):
         return
     try:
         from plugins.flashhead import screens
         screens.wake()
-        from core.devices import glass
-        device = (event.metadata or {}).get("device") or ""
-        for d, _ in glass.av_boards():
-            if device and d == device:           # a satellite's own reply: that board's stream carries its voice, so core's sentence to it is skipped from the first
-                glass.av_mark(d)
+        meta = event.metadata or {}
+        device = meta.get("device") or ""
+        if device and screens.carries(device):   # a satellite's own reply, and a stream to that board is open now: it carries this reply's voice, so core's sentence door skips it there from the first word. Not open: core's door carries it and the stream only mouths. One door per reply, and no health call here (scouts 2026-11-05)
+            screens.claim(device, meta.get("stream_id"))
     except Exception as e:
         logger.debug(f"[flashhead] screens not woken: {e}")
     try:
         path, _ = faces.current(chat=getattr(event, "chat_name", None))
         if path:
             url, body, headers = faces.face_body(path)
-            _post(url, timeout=3, data=body, headers=headers)
+            _post(url + "&soon=1", timeout=3, data=body, headers=headers)   # soon: her voice is about to be made, a live idle leaves it the GPU
     except Exception as e:
         logger.debug(f"[flashhead] face pick skipped: {e}")
 
@@ -71,7 +76,7 @@ def tts_chunk_audio(event):
     meta = event.metadata or {}
     audio = meta.get("audio") or {}
     data = audio.get("audio_bytes")
-    if not data or not _ready["ok"]:
+    if not data or not _ready["ok"] or _sealed_away(event):
         return
     if len(_tally) > 32:                         # a stream that never ended: forget, never grow
         _tally.clear()
@@ -107,6 +112,11 @@ def tts_chunk_audio(event):
 def tts_stream_end(event):
     meta = event.metadata or {}
     t = _tally.pop(meta.get("stream_id"), None)
+    try:
+        from core.devices import glass
+        glass.av_release(sid=meta.get("stream_id"))   # the reply is over: whichever board carried it, core's sentence door is its own again
+    except Exception:
+        pass
     if t and (t["face"] or set(t["here"]) - {"no viewer", "a device plays it"}):   # the panel closed: nothing to say
         here = ", ".join(f"{n} {w}" for w, n in t["here"].items())
         logger.info(f"[flashhead] reply: {t['face']} to the face, {sum(t['here'].values())} played here"
@@ -114,6 +124,7 @@ def tts_stream_end(event):
     if not _ready["ok"]:
         return
     try:
-        _post("/flush" if meta.get("interrupted") else "/end", timeout=1)
+        sid = quote(str(meta.get("stream_id") or ""))
+        _post((f"/flush?sid={sid}" if sid else "/flush") if meta.get("interrupted") else "/end", timeout=1)   # a reply cut at core flushes itself alone, never another chat's (scouts 2026-11-05)
     except Exception:
         pass
