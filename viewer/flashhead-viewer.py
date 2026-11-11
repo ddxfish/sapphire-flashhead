@@ -222,7 +222,7 @@ class Player(QObject):
                     r = self.http.get(f"{self.base}/face", timeout=10)
                     if r.ok:
                         self.still.emit(QImage.fromData(r.content))
-                url = f"{self.base}/stream?lat={self.clock.latency:.3f}" + ("&audio=0" if self.mute else "")
+                url = f"{self.base}/stream?lat={self.clock.latency:.3f}" + ("&audio=0" if self.mute else "&speaker=1")
                 with self.http.get(url, stream=True, timeout=(10, 30)) as r:
                     if r.status_code != 200:
                         raise ConnectionError(words(r))
@@ -246,23 +246,22 @@ class Player(QObject):
             if head.get("kind") == "flush":
                 self.flush()
                 continue
-            if not head.get("frames"):
-                continue
-            body = read_exact(raw, head["audio"] + sum(head["frames"]))
+            if not head.get("frames") and not head.get("audio"):
+                continue                    # a keepalive
+            body = read_exact(raw, head["audio"] + sum(head["frames"]))   # her voice without a face (a failed render) still has its bytes
             self.place(head, body)
 
     def place(self, head, body):
-        # frames decoded BEFORE her voice is placed: a busy CPU pauses her whole, never splits her
-        side, p, imgs = self.side, head["audio"], []
+        # frames kept as JPEG bytes, decoded only when shown (due): seconds of them wait
+        # here while her words are banked ahead, and a skipped frame costs nothing
+        p, imgs = head["audio"], []
         for n in head["frames"]:
-            img = QImage.fromData(body[p:p + n], "JPEG")
+            imgs.append(body[p:p + n])
             p += n
-            if not img.isNull():
-                imgs.append(img if img.width() == side else
-                            img.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         fps = head["fps"]
-        dur = len(head["frames"]) / fps
-        t = max(self.next, self.clock.now() + LEAD)
+        dur = len(head["frames"]) / fps if head["frames"] else head["audio"] / 2 / head["sr"]
+        now = self.clock.now()
+        t = self.next if self.next > now + 0.01 else now + LEAD    # on time: straight on, no gap; late: a fresh margin
         if head["audio"]:
             pcm = np.frombuffer(body[:head["audio"]], np.int16)
             if head["sr"] != SR:
@@ -283,12 +282,17 @@ class Player(QObject):
         self.next = 0.0
 
     def due(self):
-        """The newest frame whose moment has come; older ones are skipped."""
+        """The newest frame whose moment has come, decoded; older ones are skipped."""
         now, show = self.clock.heard(), None
         with self.lock:
             while self.frames and self.frames[0][0] <= now:
                 show = self.frames.popleft()[1]
-        return show
+        if show is None:
+            return None
+        img, side = QImage.fromData(show, "JPEG"), self.side
+        if img.isNull():
+            return None
+        return img if img.width() == side else img.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def talking(self):
         return self.clock.heard() < self.talk_end

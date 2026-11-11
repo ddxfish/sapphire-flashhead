@@ -111,7 +111,8 @@ def _serve(s):
                 if unit:
                     jpeg, voice = unit
                     try:
-                        shown = _canvas(jpeg)
+                        if jpeg is not None:     # None: her voice came without a face
+                            shown = _canvas(jpeg)
                     except Exception:
                         pass                     # a broken frame: the last one holds
                     pcm = voice if voice is not None and len(voice) == TICK else hush
@@ -220,9 +221,12 @@ class _Feed:
                     continue
                 body = _read(raw, head.get("audio", 0) + sum(head.get("frames", [])))
                 frames = head.get("frames")
-                if not frames:
-                    continue
                 voice = np.frombuffer(body[:head["audio"]], np.int16) if head["audio"] else None
+                if not frames:                  # her voice without a face (a failed render): the last frame holds
+                    if voice is not None:
+                        with self.lock:
+                            self.units.extend((None, voice[i:i + TICK]) for i in range(0, len(voice) - TICK + 1, TICK))
+                    continue
                 n, at, units = len(frames), head["audio"], []
                 for i, size in enumerate(frames):
                     units.append((body[at:at + size],

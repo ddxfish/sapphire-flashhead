@@ -1,7 +1,7 @@
 {
   "name": "flashhead",
   "short_display_name": "Avatar FlashHead",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "min_core_version": "2.15.3",
   "description": "Live talking face \u2014 SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
   "author": "Teri and Chris",
@@ -64,18 +64,21 @@
     "hooks": {
       "tts_stream_start": "hooks/voice.py",
       "tts_chunk_audio": "hooks/voice.py",
-      "tts_stream_end": "hooks/voice.py"
+      "tts_stream_end": "hooks/voice.py",
+      "tts_stop": "hooks/voice.py"
     },
     "routes": [
       {
         "method": "GET",
         "path": "status",
-        "handler": "routes/api.py:status"
+        "handler": "routes/api.py:status",
+        "live": true
       },
       {
         "method": "GET",
         "path": "stream",
-        "handler": "routes/api.py:stream"
+        "handler": "routes/api.py:stream",
+        "live": true
       },
       {
         "method": "GET",
@@ -188,6 +191,13 @@
           }
         ],
         "help": "Loop: a few calm seconds rendered once per face and replayed, the stretch closest to her real face. Live: rendered as she sits, never repeats, and her next words flow on from where she is; the GPU works the whole time someone watches. Live, light: the same at half speed, each rendered second shown over two, for about half the GPU. In both, when a reply starts she holds her last second until her first words, so her voice has the whole GPU."
+      },
+      {
+        "key": "voice_everywhere",
+        "type": "boolean",
+        "label": "Her voice on every viewer",
+        "default": false,
+        "help": "Off: one viewer plays her voice (her webcam call, else the standalone viewer, else the newest browser) and the others show her face in silence, so two in one room never echo. On: every viewer with sound plays it at once, your desktop and a Pi viewer in another room alike."
       },
       {
         "key": "screens",

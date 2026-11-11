@@ -110,7 +110,7 @@ def face_body(path, s=None):
     """(url, body, headers) that show this face: its path to this computer's
     server, the image itself to a worker elsewhere. Asks for her idle mode too."""
     s = s or settings()
-    url = f"/face?idle={s.get('idle') or 'loop'}"
+    url = f"/face?idle={s.get('idle') or 'loop'}&voices={'all' if s.get('voice_everywhere') else 'one'}"
     if worker(s):
         kind = Path(path).suffix.lower().lstrip(".").replace("jpg", "jpeg") or "png"
         return url, Path(path).read_bytes(), {"Content-Type": f"image/{kind}"}

@@ -5,14 +5,16 @@
 // While she speaks a ■ sits on her face: a tap stops her, here at once, at the
 // server (the rest of the reply) and at its source (the pump, by stream id).
 export const BASE = '/api/plugin/flashhead';
+const MARGIN = 0.15;            // a late packet (or the first) starts this far ahead: the audio path's own room
+const DECODE_AHEAD = 1.0;       // frames are decoded this long before their moment
 export const csrf = () => document.querySelector('meta[name="csrf-token"]')?.content || '';
 
 function createPlayer(canvas, onTalk) {
     const g = canvas.getContext('2d');
-    let ctx = null, abort = null, raf = 0, next = 0, frames = [], sources = [], gen = 0;
-    let chain = Promise.resolve(), voiced = false, voiceEnd = 0, lastRaf = 0, clock = 0;
+    let ctx = null, abort = null, raf = 0, next = 0, frames = [], sources = [];
+    let voiced = false, voiceEnd = 0, lastRaf = 0, clock = 0;
     let talkEnd = 0, talking = false, sid = '';     // her words being heard (voiced or mouthed here), and whose stream
-    const fresh = () => ({ packets: 0, gaps: 0, gap_s: 0, wait: 0, wait_max: 0, late: 0, stalls: 0, paused: 0 });
+    const fresh = () => ({ packets: 0, gaps: 0, gap_s: 0, ahead: 0, ahead_min: 0, late: 0, stalls: 0, paused: 0 });
     let st = fresh();                   // this reply's numbers: one line in her server log when she goes quiet
 
     // The moment now being heard: the device's own timestamp (WASAPI, USB,
@@ -35,23 +37,31 @@ function createPlayer(canvas, onTalk) {
         lastRaf = ms;
         const now = heard();
         if ((now < talkEnd) !== talking) onTalk(talking = now < talkEnd);
+        // Frames wait as JPEG bytes (seconds of them while her words are banked ahead);
+        // the next second's are decoded on the way, the rest stay small.
+        for (const f of frames) {
+            if (f.t > now + DECODE_AHEAD) break;
+            if (!f.p) f.p = createImageBitmap(f.blob).then(b => { if (f.dead) b.close(); else f.bmp = b; }).catch(() => {});
+        }
         let show = null;
         while (frames.length && frames[0].t <= now) {
-            if (show) { show.bmp.close(); if (now - show.t > 0.1) st.late++; }    // never shown: its moment passed
+            if (show) { drop(show); if (now - show.t > 0.1) st.late++; }     // never shown: its moment passed
             show = frames.shift();
         }
+        if (show && !show.bmp) { drop(show); st.late++; show = null; }   // not decoded in time: the last frame holds
         if (show) {
             const px = Math.round(canvas.clientWidth * (window.devicePixelRatio || 1));
             if (px && canvas.width !== px) { canvas.width = canvas.height = px; g.imageSmoothingQuality = 'high'; }
             g.drawImage(show.bmp, 0, 0, canvas.width, canvas.height);
-            show.bmp.close();
+            drop(show);
         }
         if (st.packets && ctx.currentTime > voiceEnd + 1.5) report();
     }
 
+    function drop(f) { f.dead = true; f.bmp?.close(); f.bmp = null; }
+
     function report() {
-        const out = { ...st, wait_ms: st.wait / st.packets, out: Math.max(0, ctx.currentTime - heard()), clock, sr: ctx.sampleRate };
-        delete out.wait;
+        const out = { ...st, ahead: st.ahead / st.packets, out: Math.max(0, ctx.currentTime - heard()), clock, sr: ctx.sampleRate };
         st = fresh();
         voiced = false;
         fetch(`${BASE}/viewer`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
@@ -59,38 +69,33 @@ function createPlayer(canvas, onTalk) {
     }
 
     function flush() {                  // she was stopped: cut what's scheduled
-        gen++;                          // packets still decoding belong to what was cut
         const now = heard();
         sources.forEach(s => { try { s.stop(); } catch {} });
         sources = [];
-        frames = frames.filter(f => (f.t <= now) || (f.bmp.close(), false));
+        frames = frames.filter(f => (f.t <= now) || (drop(f), false));
         next = 0;
         voiced = false;
         talkEnd = 0;
     }
 
-    // A packet's frames are decoded BEFORE its voice is scheduled, and both
-    // are placed together, in arrival order: a busy CPU then delays her
-    // whole (a pause), it never lets her voice run on while her mouth waits.
+    // A packet's voice and frames are placed together on arrival, in order: the
+    // frames as JPEG bytes, decoded in draw() a second before their moment.
     function schedule(head, bytes, off) {
-        const g0 = gen, got = performance.now();
         const audio = head.audio ? bytes.slice(off, off + head.audio) : null;
         let p = off + head.audio;
-        const hidden = document.hidden;     // a background tab: her voice plays on, frames nobody can see are not decoded
-        const decoded = Promise.all(hidden ? [] : head.frames.map(len =>
-            createImageBitmap(new Blob([bytes.subarray(p, p += len)], { type: 'image/jpeg' })).catch(() => null)));
-        chain = chain.then(() => decoded).then(bmps => {
-            if (!ctx || g0 !== gen) return bmps.forEach(b => b?.close());     // stopped or flushed while it decoded
-            place(head, audio, bmps, performance.now() - got);
-        }).catch(() => {});
+        const blobs = document.hidden ? [] :    // a background tab: her voice plays on, frames nobody can see are dropped
+            head.frames.map(len => new Blob([bytes.subarray(p, p += len)], { type: 'image/jpeg' }));
+        place(head, audio, blobs);
     }
 
-    function place(head, audio, bmps, waited) {
+    function place(head, audio, blobs) {
         const dur = head.frames.length ? head.frames.length / head.fps : head.audio / 2 / head.sr;   // her voice without a face still takes its time
-        const t = Math.max(next, ctx.currentTime + 0.15);
+        const ahead = next - ctx.currentTime;   // what was still to play when this came
+        const t = ahead > 0.01 ? next : ctx.currentTime + MARGIN;      // on time: straight on, no gap; late: a fresh margin
         if (audio) {
             if (voiced && t > next + 0.02) { st.gaps++; st.gap_s += t - next; }     // she was mid-reply and this came late
-            st.packets++; st.wait += waited; st.wait_max = Math.max(st.wait_max, waited);
+            if (voiced) { st.ahead_min = st.packets > 1 ? Math.min(st.ahead_min, ahead) : ahead; }
+            st.packets++; st.ahead += Math.max(0, ahead);
             voiced = true;
             voiceEnd = t + dur;
             const pcm = new Int16Array(audio.buffer);
@@ -106,7 +111,7 @@ function createPlayer(canvas, onTalk) {
         } else voiced = false;
         next = t + dur;
         if (head.kind === 'speech') { talkEnd = t + dur; sid = head.sid || ''; }
-        bmps.forEach((bmp, i) => bmp && frames.push({ t: t + i / head.fps, bmp }));
+        blobs.forEach((blob, i) => frames.push({ t: t + i / head.fps, blob, bmp: null, p: null, dead: false }));
     }
 
     async function start() {
@@ -142,12 +147,11 @@ function createPlayer(canvas, onTalk) {
 
     function stop() {
         if (ctx && st.packets) report();
-        gen++;                              // a packet still decoding never lands in the next Watch
         abort?.abort();
         cancelAnimationFrame(raf);
         talkEnd = 0;
         if (talking) onTalk(talking = false);
-        frames.forEach(f => f.bmp.close());
+        frames.forEach(drop);
         frames = [];
         sources = [];
         ctx?.close();
@@ -268,6 +272,7 @@ export function mount(root, { big = false } = {}) {
                 : !s.face_source ? 'No face yet: give her persona an avatar, or upload one in ⚙ › Faces'
                 : s.note || s.warning
                 || `${s.status} · face: ${s.face_source}${mood} · viewers: ${s.viewers ?? 0}`
+                   + ({ viewer: ' · her voice: on the standalone viewer', webcam: ' · her voice: on the webcam call' }[s.voice_on] || '')
                    + (s.gpu?.speed ? ` · ${s.gpu.speed}x real time, ${s.gpu.took_gb} GB` : '');
             show();
             const key = `${s.face_source}|${s.mood}|${s.face_changed || ''}`;

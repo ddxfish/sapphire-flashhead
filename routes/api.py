@@ -49,6 +49,8 @@ async def stream(settings=None, query=None, **_):
             lat = ""
         if (query or {}).get("audio") == "0":   # a face only: her voice stays where it plays now
             lat = f"{lat or '?'}{'&' if lat else ''}audio=0"
+        elif (query or {}).get("speaker") == "1":   # the standalone viewer as her speaker: keeps her voice when a browser watches too
+            lat = f"{lat or '?'}{'&' if lat else ''}speaker=1"
         resp = await client.send(client.build_request("GET", f"{base}/stream{lat}"), stream=True)
     except Exception as e:
         await client.aclose()

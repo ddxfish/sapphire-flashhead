@@ -128,3 +128,19 @@ def tts_stream_end(event):
         _post((f"/flush?sid={sid}" if sid else "/flush") if meta.get("interrupted") else "/end", timeout=1)   # a reply cut at core flushes itself alone, never another chat's (scouts 2026-11-05)
     except Exception:
         pass
+
+
+def tts_stop(event):
+    """The ⏹ (or a tap on another face): her voice stops. A reply made whole
+    ended at the pump before a word of it was heard, so its tts_stream_end
+    never flushed her: this does, that reply alone when the browser named it."""
+    if not _ready["ok"]:
+        return
+    meta = event.metadata or {}
+    sid = meta.get("stream_id")
+    if not sid and not meta.get("chat_wide"):
+        return
+    try:
+        _post(f"/flush?sid={quote(str(sid))}" if sid else "/flush", timeout=1)
+    except Exception:
+        pass
