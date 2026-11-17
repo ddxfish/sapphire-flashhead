@@ -1,11 +1,11 @@
 {
   "name": "flashhead",
   "short_display_name": "Avatar FlashHead",
-  "version": "1.8.1",
+  "version": "1.8.3",
   "min_core_version": "2.15.3",
-  "description": "Live talking face \u2014 SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
+  "description": "Live talking face — SoulX-FlashHead lip-syncs her persona avatar to her streaming voice, on the GPU in its own conda env",
   "author": "Teri and Chris",
-  "icon": "\ud83d\udde3\ufe0f",
+  "icon": "🗣️",
   "priority": 50,
   "default_enabled": false,
   "privacy_aware": true,
@@ -139,13 +139,13 @@
     ],
     "sidebar_accordion": {
       "title": "FlashHead",
-      "icon": "\ud83d\udde3\ufe0f",
+      "icon": "🗣️",
       "content": "sidebar.html",
       "script": "sidebar.js"
     },
     "app": {
       "label": "FlashHead",
-      "icon": "\ud83d\udde3\ufe0f",
+      "icon": "🗣️",
       "description": "Her live talking face, full size",
       "nav": "chat"
     },
@@ -200,27 +200,6 @@
         "help": "Off: one viewer plays her voice (her webcam call, else the standalone viewer, else the newest browser) and the others show her face in silence, so two in one room never echo. On: every viewer with sound plays it at once, your desktop and a Pi viewer in another room alike."
       },
       {
-        "key": "screens",
-        "type": "string",
-        "label": "Her face on her screens",
-        "default": "talking",
-        "options": [
-          {
-            "label": "Off",
-            "value": "off"
-          },
-          {
-            "label": "While she talks",
-            "value": "talking"
-          },
-          {
-            "label": "Always",
-            "value": "always"
-          }
-        ],
-        "help": "Sapphire ESP32 satellites with a screen (the Waveshare board on satellite firmware 0.7.7+) show her face: while she talks, or always (her idle loop at 2 fps between replies). A board stays a speaker first; nothing else on it changes."
-      },
-      {
         "key": "face_px",
         "type": "number",
         "label": "Her face's size on a screen (px)",
@@ -264,6 +243,30 @@
           "camera_voice": true
         },
         "help": "Her voice on this computer's speakers as well as in the call."
+      },
+      {
+        "key": "camera_delay",
+        "type": "number",
+        "label": "Picture delay (ms)",
+        "default": 0,
+        "min": 0,
+        "max": 2000,
+        "tab": "Webcam",
+        "show_if": {
+          "camera": true
+        },
+        "help": "Holds her picture back so her lips meet her voice. A virtual cable (VB-Cable) and the call's own mic buffer make her voice late, by an amount nothing here can measure. If her lips move before you hear her, raise it: start near the ms the status line below gives for her mic, then go up in steps of 40 (one frame). Saving takes effect as she plays, the camera stays on."
+      },
+      {
+        "key": "camera_low_latency",
+        "type": "boolean",
+        "label": "Shorter mic buffer",
+        "default": false,
+        "tab": "Webcam",
+        "show_if": {
+          "camera_voice": true
+        },
+        "help": "Asks the mic's sound device for its shortest buffer, so her voice reaches the call sooner and her picture needs less delay. For VB-Cable on Windows, or a device named in Mic device; her own PipeWire mic on Linux is short already. If her voice crackles or drops out, turn it off. Set this first, then the picture delay."
       },
       {
         "key": "camera_device",

@@ -7,10 +7,14 @@ the browser player gets them. Each is decoded whole, then its voice and
 frames are placed together on the speaker's clock and drawn where the ear
 is, so the mouth can't drift from the voice (web/player.js, in Python).
 
-    python flashhead-viewer.py --host 192.168.1.50 --key <API key> [--fullscreen] [--mute]
+    python flashhead-viewer.py --host 192.168.1.50 --key <API key> [--fullscreen] [--mute] [--camera]
+                               [--camera-delay MS]
 
 The key: Sapphire's Settings > System > API Keys. Esc or Q quits, F toggles fullscreen.
 A click on her face (or Space) while she speaks stops her: here, at the server, at its source.
+C (or a right click) turns her face into a webcam a call can pick, and back.
+[ and ] hold the webcam's picture back less or more, 40 ms a press, for a voice that
+reaches the call late (a virtual cable); --camera-delay starts with a number.
 """
 import argparse
 import hashlib
@@ -32,10 +36,12 @@ import urllib3
 from requests.adapters import HTTPAdapter
 from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 LEAD = 0.15             # how far ahead of now a packet is placed (the browser's same margin)
 SR = 24000              # what the server sends (server.py PLAY_SR)
+CAM_W, CAM_H, CAM_FPS = 1280, 720, 25   # the webcam's picture (camera.py's): 16:9, a call crops a square camera
+CAM_DELAY_MAX, CAM_STEP = 2000, 40      # ms: the most her picture waits, and one press of [ or ] (a frame)
 PINS = Path.home() / ".config" / "flashhead-viewer" / "pins.json"
 
 
@@ -122,6 +128,129 @@ class Silent:
 
     def close(self):
         pass
+
+
+# ── the webcam ───────────────────────────────────────────────────────────────
+
+def canvas(img):
+    """Her square face in the middle of a 16:9 picture, as RGB for the camera."""
+    if not isinstance(img, QImage):
+        img = QImage.fromData(img)
+    if img.isNull():
+        raise ValueError("not a picture")
+    img = img.scaled(CAM_H, CAM_H, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).convertToFormat(QImage.Format_RGB888)
+    rows = np.frombuffer(img.constBits(), np.uint8).reshape(CAM_H, img.bytesPerLine())
+    out = np.zeros((CAM_H, CAM_W, 3), np.uint8)
+    x = (CAM_W - CAM_H) // 2
+    out[:, x:x + CAM_H] = rows[:, :CAM_H * 3].reshape(CAM_H, CAM_H, 3)
+    return out
+
+
+def cam_words(e):
+    if isinstance(e, ImportError):
+        return ("The camera needs the pyvirtualcam package: pip install pyvirtualcam "
+                "(if pip finds none, this Python is too new for it: use Python 3.14)")
+    text = str(e) or type(e).__name__
+    if sys.platform == "win32" and "not found" in text:
+        return "No camera: install OBS Studio (her camera is OBS's virtual camera; OBS itself can stay closed)"
+    if sys.platform == "win32" and "could not be started" in text:
+        return ("The camera would not start: is OBS's own Start Virtual Camera on, "
+                "or another program sending to it? One at a time.")
+    if sys.platform == "linux":
+        return (f"No free camera ({text}). Linux needs v4l2loopback: "
+                "sudo modprobe v4l2loopback exclusive_caps=1 card_label=\"Sapphire Cam\"")
+    return f"camera: {text}"
+
+
+class Camera(QObject):
+    """Her face as a webcam a call can pick (Zoom, Meet, Discord): pyvirtualcam's
+    camera, which is OBS's on Windows (OBS installed, not running) and a
+    v4l2loopback device on Linux. A thread of its own sends the frame the window
+    shows 25 times a second, her still while there is no stream: a call wants a
+    steady picture. Her voice for the call is --device (VB-Cable's CABLE Input).
+
+    The window shows each frame when the sound device says its voice comes out.
+    A cable and the call's mic buffer add more that no device reports, so the
+    camera's picture can wait `delay` ms longer than the window's ([ and ])."""
+    said = Signal(str)
+
+    def __init__(self, device, delay=0):
+        super().__init__()
+        self.device = device
+        self.delay = min(max(int(delay), 0), CAM_DELAY_MAX)
+        self.lock = threading.Lock()
+        self.late = deque()                 # (when given, frame) on their way to the camera
+        self.last = self.still = None       # the newest frame given (JPEG bytes or a QImage); her still face
+        self.stop = None                    # set while it is on, or opening
+        self.live = False                   # the camera is open and fed
+        self.thread = None
+
+    def give(self, frame):
+        with self.lock:
+            self.last = frame
+            if self.stop:                   # off: only the newest is kept
+                self.late.append((time.monotonic(), frame))
+
+    def nudge(self, ms):
+        self.delay = min(max(self.delay + ms, 0), CAM_DELAY_MAX)
+        self.said.emit(f"camera delay {self.delay} ms (--camera-delay {self.delay} starts with it)")
+
+    def on_still(self, img):
+        self.still = img
+        self.give(img)
+
+    def on_status(self, text):
+        if text and self.still is not None:
+            self.give(self.still)           # no stream: her still, not her last moving frame frozen
+
+    def toggle(self):
+        if self.stop:
+            self.stop.set()                 # its thread says "camera off" as it leaves
+            self.stop = None
+            return
+        if self.thread:
+            self.thread.join(1)             # one that is still closing: OBS's camera takes one sender
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(self.stop,), daemon=True, name="camera")
+        self.thread.start()
+
+    def close(self):
+        if self.stop:
+            self.stop.set()
+        if self.thread:
+            self.thread.join(1)
+
+    def _run(self, stop):
+        try:
+            import pyvirtualcam
+            with pyvirtualcam.Camera(CAM_W, CAM_H, CAM_FPS, device=self.device) as cam:
+                self.live = True
+                self.said.emit(f"camera on: {cam.device}")
+                shown = np.zeros((CAM_H, CAM_W, 3), np.uint8)
+                with self.lock:
+                    self.late.clear()
+                    frame = self.last       # the face as it is now, not black until her next frame
+                while not stop.is_set():
+                    edge = time.monotonic() - self.delay / 1000     # read each tick: [ and ] take hold at once
+                    with self.lock:
+                        while self.late and self.late[0][0] <= edge:
+                            frame = self.late.popleft()[1]
+                    if frame is not None:
+                        try:
+                            shown = canvas(frame)
+                        except Exception:
+                            pass            # a broken frame: the last one holds
+                        frame = None
+                    cam.send(shown)
+                    cam.sleep_until_next_frame()
+            self.live = False
+            self.said.emit("camera off")
+        except Exception as e:
+            self.live = False
+            self.said.emit(cam_words(e))
+        finally:
+            if self.stop is stop:
+                self.stop = None            # it ended by itself: the next C starts it again
 
 
 # ── the door ─────────────────────────────────────────────────────────────────
@@ -211,6 +340,7 @@ class Player(QObject):
         self.side = 512                     # the face's size on screen, frames are scaled to it here
         self.talk_end = 0.0                 # until when her words are heard, and the stream they are (a click stops it)
         self.sid = ""
+        self.tap = None                     # the webcam's: each frame as it is shown, still a JPEG
 
     def run(self):
         delay = 2
@@ -289,6 +419,8 @@ class Player(QObject):
                 show = self.frames.popleft()[1]
         if show is None:
             return None
+        if self.tap:
+            self.tap(show)
         img, side = QImage.fromData(show, "JPEG"), self.side
         if img.isNull():
             return None
@@ -318,18 +450,22 @@ class Player(QObject):
 
 
 class Face(QWidget):
-    def __init__(self, player, fullscreen):
+    NOTE_S = 8                              # the camera's words stay this long
+
+    def __init__(self, player, camera, fullscreen):
         super().__init__()
-        self.player = player
+        self.player, self.camera = player, camera
         self.image = None
         self.still = None
         self.talk = False
         self.status = "connecting..."
+        self.note, self.note_until = "", 0.0
         self.setWindowTitle("FlashHead")
         self.resize(640, 640)
         self.setStyleSheet("background: black;")
         player.status.connect(self.on_status)
         player.still.connect(self.on_still)
+        camera.said.connect(self.on_note)
         self.timer = QTimer(self, timeout=self.tick, interval=10)
         self.timer.start()
         self.full(fullscreen)
@@ -348,12 +484,19 @@ class Face(QWidget):
         self.still = img
         self.update()
 
+    def on_note(self, text):
+        self.note, self.note_until = text, time.monotonic() + self.NOTE_S
+        self.update()
+
     def tick(self):
         img = self.player.due()
         talk = self.player.talking()
         if img is not None:
             self.image = img
-        if img is not None or talk != self.talk:
+        gone = self.note and time.monotonic() > self.note_until
+        if gone:
+            self.note = ""
+        if img is not None or talk != self.talk or gone:
             self.talk = talk
             self.update()
 
@@ -373,19 +516,36 @@ class Face(QWidget):
             g.setOpacity(1.0)
         if self.talk:                       # a click on her face stops her
             g.fillRect(QRect(box.right() - side // 12, box.top() + side // 24, side // 24, side // 24), QColor(255, 255, 255, 210))
-        if self.status:
+        if self.camera.live:                # a call may be seeing her: a red dot says so
+            g.setRenderHint(QPainter.Antialiasing)
+            g.setPen(Qt.NoPen)
+            g.setBrush(QColor(230, 60, 60, 220))
+            g.drawEllipse(QRect(box.left() + side // 24, box.top() + side // 24, side // 32, side // 32))
+        if self.status or self.note:
             g.setPen(QColor(200, 200, 200))
             g.setFont(QFont("sans", max(10, side // 40)))
             g.drawText(self.rect().adjusted(16, 0, -16, -16), Qt.AlignHCenter | Qt.AlignBottom | Qt.TextWordWrap,
-                       self.status)
+                       self.status or self.note)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Escape, Qt.Key_Q):
             self.close()
         elif e.key() in (Qt.Key_F, Qt.Key_F11):
             self.full(not self.isFullScreen())
+        elif e.key() == Qt.Key_C:
+            self.camera.toggle()
+        elif e.key() in (Qt.Key_BracketLeft, Qt.Key_BracketRight):
+            self.camera.nudge(CAM_STEP if e.key() == Qt.Key_BracketRight else -CAM_STEP)
         elif e.key() == Qt.Key_Space and self.player.talking():
             self.player.hush()
+
+    def contextMenuEvent(self, e):
+        menu = QMenu(self)
+        cam = menu.addAction("Her face as a webcam (C)")
+        cam.setCheckable(True)
+        cam.setChecked(bool(self.camera.stop))
+        if menu.exec(e.globalPos()) is cam:
+            self.camera.toggle()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton and self.player.talking():
@@ -407,6 +567,12 @@ def main():
     ap.add_argument("--device", default=os.environ.get("FLASHHEAD_DEVICE"),
                     help="sound output, a number or part of a name from --list-devices")
     ap.add_argument("--list-devices", action="store_true", help="list sound outputs and quit")
+    ap.add_argument("--camera", nargs="?", const="", metavar="DEVICE",
+                    help="start with her face as a webcam (C toggles). Windows: OBS's virtual camera, OBS installed "
+                         "but closed. Linux: a v4l2loopback device, the first free one or the one named (/dev/video3)")
+    ap.add_argument("--camera-delay", type=int, default=0, metavar="MS",
+                    help="hold the webcam's picture back this many ms, for a voice that reaches the call late "
+                         "(VB-Cable). Her lips move before her voice: raise it. [ and ] change it as she plays")
     a = ap.parse_args()
 
     if a.list_devices:
@@ -423,9 +589,16 @@ def main():
     except Exception as e:
         sys.exit(f"No sound output ({e}). Pick one from --list-devices, or --mute.")
     player = Player(origin, a.key, clock, a.mute)
-    face = Face(player, a.fullscreen)
+    camera = Camera(a.camera or None, a.camera_delay)
+    player.tap = camera.give
+    player.still.connect(camera.on_still)
+    player.status.connect(camera.on_status)
+    face = Face(player, camera, a.fullscreen)
+    if a.camera is not None:
+        camera.toggle()
     threading.Thread(target=player.run, daemon=True).start()
     code = app.exec()
+    camera.close()
     clock.close()
     sys.exit(code)
 

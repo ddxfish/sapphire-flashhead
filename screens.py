@@ -39,7 +39,13 @@ def _feed():
 
 
 def _mode():
-    return faces.settings().get("screens") or "talking"
+    """off | talking | always, as core says (avatar_feed.mode_for): off unless Settings > Devices >
+    Settings chose FlashHead as her face, else the strongest mode her screens ask for. Each screen's
+    own mode is set on its Devices page (2026-11-12; this was the plugin's `screens` setting)."""
+    try:
+        return _feed().mode_for(NAME)
+    except Exception:
+        return "off"
 
 
 def _register():
@@ -128,7 +134,7 @@ def _run():
             _wake.clear()
             _again.clear()
             continue
-        if not _ours or _again.is_set():
+        if not _ours or _again.is_set() or _feed().source() != NAME:   # the seat moved away and back behind our back (Devices picker): take it again
             _again.clear()
             if not _register():
                 _stop.wait(10)                   # another avatar is her face: ask again when it may have let go

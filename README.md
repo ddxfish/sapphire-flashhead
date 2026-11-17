@@ -69,6 +69,8 @@ Her live face as a camera, and her voice as a mic, that a call or stream can pic
 
 While the webcam is on, her face renders all the time: cheap with the calm loop, but with *Live* the GPU stays busy. With *Her voice as a mic* on, her voice goes only to the call; turn on *Hear her here too* to also hear her on this computer's speakers. If something's missing, the Webcam tab says what to install.
 
+**Her lips move before her voice.** A virtual cable and the call's own mic buffer make her voice late. *Picture delay (ms)* on the Webcam tab holds her picture back to meet it: start near the ms the tab's status line gives for her mic, then go up in steps of 40. It changes as she plays; the camera stays on. *Shorter mic buffer* asks the sound device for less delay to begin with (turn it off if her voice crackles); set it first, then the picture delay.
+
 ## Her face on another screen
 
 `viewer/` is a standalone window for her face and voice on any computer that reaches your Sapphire (a Raspberry Pi on a screen): an API key, her address, `--fullscreen`, `--mute`. Its own `requirements.txt`, nothing of Sapphire's. See `viewer/README.md`.

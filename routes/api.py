@@ -190,5 +190,5 @@ def camera_status(**_):
 def camera_retry(**_):
     """After an install, or a camera freed elsewhere: try again now."""
     from plugins.flashhead import camera
-    camera.on_settings_saved(None)
+    camera.retry()
     return {"ok": True}

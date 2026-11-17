@@ -11,7 +11,10 @@ plays on; with no stream her still face holds: a call wants a steady picture.
 Settings (Webcam tab): `camera` on/off; `camera_voice` the camera carries her
 voice (no other viewer plays it then, server.py call=1); `camera_hear` her
 voice on this computer's speakers as well; `camera_device` and `camera_mic`
-name the devices, empty finds them.
+name the devices, empty finds them; `camera_delay` holds her picture back by
+that many ms for a mic path that is late (VB-Cable, the call's own buffer),
+taken as she plays; `camera_low_latency` asks the mic's device for its
+shortest buffer.
 """
 import io
 import json
@@ -33,12 +36,15 @@ logger = logging.getLogger(__name__)
 W, H, FPS, SR = 1280, 720, 25, 24000     # 16:9: a call crops a square camera; SR = server.py PLAY_SR
 TICK = SR // FPS                          # her voice per frame
 MAX_S = 2.0
+MAX_DELAY_MS = 2000
 CABLE = "CABLE Input"                     # VB-Cable's playback end: the call picks "CABLE Output" as its mic
 PW_PROPS = '{ media.class=Audio/Source node.name=sapphire-voice node.description="Sapphire Voice" }'
 
 _stop = threading.Event()
 _again = threading.Event()                # settings saved or Retry: start over
-_state = {"status": "off", "error": "", "device": "", "mic": ""}
+_state = {"status": "off", "error": "", "device": "", "mic": "", "mic_ms": 0}
+_lag = 0                                  # ticks her picture waits for her voice (camera_delay)
+_opened = None                            # what the camera is open with, her delay aside: only a change in these reopens it
 
 
 def start(plugin_loader, settings):
@@ -52,7 +58,43 @@ def stop():
 
 
 def on_settings_saved(settings):
+    """A new delay alone is taken as she plays (a call would see the camera
+    blink at every step of tuning it); anything else opens the camera again."""
+    global _lag
+    s = faces.settings()
+    _lag = _ticks(s)
+    if _rest(s) != _opened:
+        _again.set()
+
+
+def retry():
     _again.set()
+
+
+def _ticks(s):
+    try:
+        ms = float(s.get("camera_delay") or 0)
+    except (TypeError, ValueError):
+        ms = 0
+    return round(min(max(ms, 0), MAX_DELAY_MS) * FPS / 1000)
+
+
+def _rest(s):
+    return {k: v for k, v in s.items() if k != "camera_delay"}
+
+
+def _late(line, pic, lag):
+    """Her picture, `lag` ticks late: a virtual cable and the call's mic buffer
+    make her voice late, so her face waits for it. `pic` is this tick's frame
+    (None: the last one holds). Gives the frame whose turn it is, else None.
+    A stop leaves the line alone: the frames in it belong to the voice that is
+    already in the cable, and both run out together."""
+    line.append(pic)
+    out = None
+    while len(line) > lag:
+        got = line.popleft()
+        out = got if got is not None else out
+    return out
 
 
 def status():
@@ -64,13 +106,13 @@ def _run():
         _again.clear()
         s = faces.settings()
         if not s.get("camera"):
-            _state.update(status="off", error="", device="", mic="")
+            _state.update(status="off", error="", device="", mic="", mic_ms=0)
             _again.wait()
             continue
         try:
             _serve(s)
         except Exception as e:
-            _state.update(status="error", error=_words(e), device="", mic="")
+            _state.update(status="error", error=_words(e), device="", mic="", mic_ms=0)
             logger.warning(f"[flashhead] webcam: {_state['error']}")
             _again.wait(30)
 
@@ -89,8 +131,10 @@ def _words(e):
 
 
 def _serve(s):
+    global _lag, _opened
     import pyvirtualcam
     outs = []
+    _lag = _ticks(s)
     device = str(s.get("camera_device") or "").strip() or None
     with pyvirtualcam.Camera(W, H, FPS, device=device) as cam:
         feed = None
@@ -99,25 +143,30 @@ def _serve(s):
                 outs.append(_mic(s))
                 if s.get("camera_hear"):
                     outs.append(_Speaker(None))
-            _state.update(status="on", error="", device=cam.device, mic=outs[0].name if outs else "")
+            mic_ms = round(outs[0].latency * 1000) if outs else 0
+            _state.update(status="on", error="", device=cam.device, mic=outs[0].name if outs else "", mic_ms=mic_ms)
+            _opened = _rest(s)
             logger.info(f"[flashhead] her face on webcam {cam.device}"
-                        + (f", her voice on {outs[0].name}" if outs else ", no voice"))
+                        + (f", her voice on {outs[0].name} ({mic_ms} ms to the device)" if outs else ", no voice")
+                        + f", picture delay {_lag * 1000 // FPS} ms")
             feed = _Feed(bool(outs))
             still = shown = _canvas(_still(s))
             hush = np.zeros(TICK, np.int16)
+            line = deque()                       # her picture on its way to the camera: JPEGs, small
             while not _stop.is_set() and not _again.is_set():
                 unit = feed.next()
-                pcm = hush
+                pcm, pic = hush, None
                 if unit:
-                    jpeg, voice = unit
-                    try:
-                        if jpeg is not None:     # None: her voice came without a face
-                            shown = _canvas(jpeg)
-                    except Exception:
-                        pass                     # a broken frame: the last one holds
+                    pic, voice = unit            # pic None: her voice came without a face
                     pcm = voice if voice is not None and len(voice) == TICK else hush
                 elif not feed.live:
-                    shown = still
+                    pic = still
+                pic = _late(line, pic, _lag)
+                if pic is not None:
+                    try:
+                        shown = pic if isinstance(pic, np.ndarray) else _canvas(pic)
+                    except Exception:
+                        pass                     # a broken frame: the last one holds
                 cam.send(shown)
                 for o in outs:
                     o.write(pcm)
@@ -127,7 +176,8 @@ def _serve(s):
                 feed.close()
             for o in outs:
                 o.close()
-            _state.update(status="off", device="", mic="")
+            _opened = None
+            _state.update(status="off", device="", mic="", mic_ms=0)
             logger.info("[flashhead] webcam off")
 
 
@@ -243,7 +293,7 @@ def _mic(s):
     VB-Cable on Windows, a PipeWire source of our own on Linux."""
     name = str(s.get("camera_mic") or "").strip()
     if name or sys.platform != "linux":
-        return _Speaker(name or CABLE)
+        return _Speaker(name or CABLE, "low" if s.get("camera_low_latency") else None)
     return _PipeWireMic()
 
 
@@ -251,7 +301,7 @@ class _Speaker:
     """Her voice to one output device (sounddevice), a tick at a time. At most
     0.4 s waits: a slow device loses her oldest words, never drifts from her face."""
 
-    def __init__(self, name):
+    def __init__(self, name, latency=None):     # None: the device's default, its long one
         import sounddevice as sd
         self.buf, self.lock = deque(), threading.Lock()
         tries = [None] if name is None else [i for i, d in enumerate(sd.query_devices())
@@ -264,13 +314,14 @@ class _Speaker:
         for dev in tries:                       # Windows lists a device per host API; not all take 24 kHz mono
             try:
                 self.stream = sd.OutputStream(samplerate=SR, channels=1, dtype="int16", device=dev,
-                                              callback=self._fill)
+                                              latency=latency, callback=self._fill)
                 break
             except Exception as e:
                 err = e
         else:
             raise RuntimeError(f"'{name}' would not open: {err}")
         self.name = sd.query_devices(self.stream.device)["name"]
+        self.latency = self.stream.latency      # what the device says of itself; a cable adds its own, unseen
         self.stream.start()
 
     def write(self, pcm):
@@ -302,6 +353,7 @@ class _PipeWireMic:
     The pipe is kept to a page (85 ms of her): nobody listening drops her
     words here instead of saving them up to play late."""
     name = "Sapphire Voice"
+    latency = 0.04                          # what pw-cat is asked for below
 
     def __init__(self):
         if not shutil.which("pw-cat"):
