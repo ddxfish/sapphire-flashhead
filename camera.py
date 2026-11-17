@@ -238,11 +238,14 @@ class _Feed:
     def _run(self):
         delay = 2
         while not self.done.is_set():
+            self.fed = False
             try:
                 self._watch()
             except Exception as e:
                 if self.done.is_set():
                     return
+                if self.fed:
+                    delay = 2                   # the stream had been good: the wait starts over
                 logger.info(f"[flashhead] webcam stream ended ({type(e).__name__}: {e}), again in {delay} s")
                 faces.forget()
             self.live = False
@@ -269,15 +272,17 @@ class _Feed:
                     with self.lock:
                         self.units.clear()
                     continue
-                body = _read(raw, head.get("audio", 0) + sum(head.get("frames", [])))
-                frames = head.get("frames")
-                voice = np.frombuffer(body[:head["audio"]], np.int16) if head["audio"] else None
+                frames, size = head.get("frames") or [], head.get("audio", 0)
+                if not frames and not size:
+                    continue                    # the server's keepalive: nothing to show for 5 s
+                self.fed = True
+                body = _read(raw, size + sum(frames))
+                voice = np.frombuffer(body[:size], np.int16) if size else None
                 if not frames:                  # her voice without a face (a failed render): the last frame holds
-                    if voice is not None:
-                        with self.lock:
-                            self.units.extend((None, voice[i:i + TICK]) for i in range(0, len(voice) - TICK + 1, TICK))
+                    with self.lock:
+                        self.units.extend((None, voice[i:i + TICK]) for i in range(0, len(voice) - TICK + 1, TICK))
                     continue
-                n, at, units = len(frames), head["audio"], []
+                n, at, units = len(frames), size, []
                 for i, size in enumerate(frames):
                     units.append((body[at:at + size],
                                   None if voice is None else voice[len(voice) * i // n:len(voice) * (i + 1) // n]))
