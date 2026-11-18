@@ -5,6 +5,7 @@ and routes. Also where her models live (models_dir), and how to reach her
 FlashHead server: this computer's, or with `client` on, the worker on another
 computer named by the pairing string in `worker` (core/worker_door.py)."""
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from core import worker_door
 from core.paths import PROJECT_ROOT
 from plugins.flashhead.worker_door import DEVICES     # its own copy: core 2.15.3 has no such list
 
+logger = logging.getLogger(__name__)
 DIR = PROJECT_ROOT / "user" / "flashhead"
 FACE = DIR / "face.png"
 MOODS = DIR / "moods"
@@ -31,6 +33,18 @@ def settings():
 
 
 HEADERS = {"X-FlashHead": "1"}       # the service takes writes only with this (server.py _ours)
+
+
+_said = [None]
+
+
+def sync_said(sync):
+    """The server's verdict on her face and voice (/health "sync": what was late
+    and whose trouble it is), into Sapphire's own log, once each: it is the log
+    people send."""
+    if sync and sync.get("at") != _said[0]:
+        _said[0] = sync.get("at")
+        logger.warning(f"[flashhead] {sync.get('text')}")
 
 
 def worker(s=None):

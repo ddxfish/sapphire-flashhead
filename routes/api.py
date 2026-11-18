@@ -28,6 +28,10 @@ async def status(settings=None, **_):
                face_changed=int(path.stat().st_mtime) if path else 0)    # when, never where: the panels' still follows a new face
     for k in ("want", "face"):                  # the server's copies carry file paths: never past this door
         out.pop(k, None)
+    from plugins.flashhead import camera
+    faces.sync_said(out.get("sync"))            # the verdict on her last reply, to Sapphire's log too
+    both = [y for y in (out.get("sync"), camera.sync()) if y]
+    out["sync"] = min(both, key=lambda y: y["ago"]) if both else None      # the server's or her webcam's, the newer
     return out
 
 
@@ -51,6 +55,8 @@ async def stream(settings=None, query=None, **_):
             lat = f"{lat or '?'}{'&' if lat else ''}audio=0"
         elif (query or {}).get("speaker") == "1":   # the standalone viewer as her speaker: keeps her voice when a browser watches too
             lat = f"{lat or '?'}{'&' if lat else ''}speaker=1"
+        if (query or {}).get("who") == "viewer" or (query or {}).get("speaker") == "1":   # the count names it (an older viewer says only speaker=1)
+            lat = f"{lat or '?'}{'&' if lat else ''}who=viewer"
         resp = await client.send(client.build_request("GET", f"{base}/stream{lat}"), stream=True)
     except Exception as e:
         await client.aclose()

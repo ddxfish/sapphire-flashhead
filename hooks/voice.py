@@ -9,6 +9,8 @@ viewer flushes the server itself and stops the pump by the stream id each packet
 carries: routes/api.py stop); a reply that ends tells the server so (/end), so a
 gap between her sentences holds the face
 instead of idling it. One line per reply says where her words went.
+A reply plays where it began: one whose first words played here stays here
+(a panel opened in the middle of it mouths the rest in silence).
 Only while the server was last seen ready: a stopped or loading service costs
 her voice nothing (looked at again at most every 10 s). The server is this
 computer's, or in client mode a worker elsewhere (faces.http()).
@@ -24,9 +26,10 @@ from plugins.flashhead import faces
 logger = logging.getLogger(__name__)
 
 
-_ready = {"ok": False, "at": 0.0}
+_ready = {"ok": False, "at": 0.0, "voice": None}     # voice: which viewer plays her voice now (the server's voice_on), None: none does
 RECHECK_S = 10
-_tally = {}              # stream_id -> {"face": n, "here": {why: n}, "slow": ms}: one log line per reply
+_tally = {}              # stream_id -> {"face": n, "here": {why: n}, "slow": ms, "lane": where it plays}: one log line per reply
+BEGAN = "the reply began here"
 
 
 def _post(path, timeout=2, **kw):
@@ -37,7 +40,10 @@ def _server_ready():
     now = time.monotonic()
     if _ready["ok"] or now - _ready["at"] > RECHECK_S:
         try:
-            ok = faces.http().get(f"{faces.base_url()}/health", timeout=0.5).json().get("status") == "ready"
+            health = faces.http().get(f"{faces.base_url()}/health", timeout=0.5).json()
+            ok = health.get("status") == "ready"
+            _ready["voice"] = health.get("voice_on")
+            faces.sync_said(health.get("sync"))      # her last reply's verdict, if no panel was open to bring it
         except Exception:
             ok = False
             faces.forget()
@@ -76,32 +82,53 @@ def tts_chunk_audio(event):
     meta = event.metadata or {}
     audio = meta.get("audio") or {}
     data = audio.get("audio_bytes")
-    if not data or not _ready["ok"] or _sealed_away(event):
+    if not data or _sealed_away(event):
+        return
+    if not _ready["ok"]:
+        t = _tally.get(meta.get("stream_id"))    # the server went mid-reply: the rest plays here, and the reply's line counts it
+        if t:
+            t["here"]["server gone"] = t["here"].get("server gone", 0) + 1
         return
     if len(_tally) > 32:                         # a stream that never ended: forget, never grow
         _tally.clear()
-    t = _tally.setdefault(meta.get("stream_id"), {"face": 0, "here": {}, "slow": 0})
+    t = _tally.setdefault(meta.get("stream_id"), {"face": 0, "here": {}, "slow": 0, "lane": None})
     here = meta.get("plays_here", True)      # False: it is a device's voice, never ours to take
     device = meta.get("device") or ""        # whose: the server hands it whole to the board streams (the owner plays it) and hushed to browsers
+    # A reply whose first words played here stays here: a panel opened in the middle of it took the next
+    # chunk for the face while this computer still played the last ones, two voices and the later words first.
+    home = bool(here) and t["lane"] == "home"
     t0 = time.monotonic()
+    sid = quote(str(meta.get("stream_id") or ""))   # core's stream: a tap on her face stops it at the source (/api/tts/stop)
     try:
-        sid = quote(str(meta.get("stream_id") or ""))   # core's stream: a tap on her face stops it at the source (/api/tts/stop)
-        r = _post(f"/speak?take={int(here)}&device={quote(device)}&sid={sid}", data=data,
+        r = _post(f"/speak?take={int(bool(here) and not home)}&device={quote(device)}&sid={sid}", data=data,
                   headers={"Content-Type": audio.get("content_type", "audio/ogg")})
         ans = r.json() if r.ok else {"why": f"HTTP {r.status_code}"}
-        event.skip_tts = bool(here and ans.get("taken"))
-        why = "" if event.skip_tts else ans.get("why") or "refused"
+        event.skip_tts = bool(here and not home and ans.get("taken"))
+        why = "" if event.skip_tts else BEGAN if home else ans.get("why") or "refused"
     except requests.exceptions.ReadTimeout:
         # It got there and is (almost surely) queued: playing it here too was
         # the double voice, and dropping the server for the rest of the reply
         # sent every later sentence home without a face (Teri, 2026-10-23).
-        event.skip_tts, why = bool(here), ""
-        logger.warning(f"[flashhead] /speak slow (over {time.monotonic() - t0:.1f}s): left to the face")
+        # Left to the face only where the face plays this reply: with no viewer
+        # that plays sound (her webcam without her voice, her screens) the
+        # server mouths it in silence, and it was heard nowhere.
+        faced = t["lane"] == "face" or (t["lane"] is None and bool(_ready["voice"]))
+        event.skip_tts = bool(here) and faced
+        why = "" if event.skip_tts else BEGAN if home else "slow, and no viewer plays her voice"
+        logger.warning(f"[flashhead] /speak slow (over {time.monotonic() - t0:.1f}s): "
+                       + ("left to the face" if event.skip_tts else "it plays here"))
     except Exception as e:
         _ready["ok"] = False                     # never reached it: gone mid-reply, the next reply looks again
         faces.forget()
         why = type(e).__name__
         logger.warning(f"[flashhead] server not taking her voice ({why}): it plays here")
+        if t["face"]:                            # its words already at the face would play on under these: dropped there, if it still answers
+            try:
+                _post(f"/flush?sid={sid}", timeout=0.5)
+            except Exception:
+                pass
+    if here and t["lane"] is None:
+        t["lane"] = "face" if event.skip_tts else "home"
     t["slow"] = max(t["slow"], int((time.monotonic() - t0) * 1000))
     if event.skip_tts:
         t["face"] += 1
@@ -117,11 +144,11 @@ def tts_stream_end(event):
         glass.av_release(sid=meta.get("stream_id"))   # the reply is over: whichever board carried it, core's sentence door is its own again
     except Exception:
         pass
-    if t and (t["face"] or set(t["here"]) - {"no viewer", "a device plays it"}):   # the panel closed: nothing to say
+    if t and (t["face"] or set(t["here"]) - {"no viewer", "a device plays it", BEGAN}):   # the panel closed: nothing to say
         here = ", ".join(f"{n} {w}" for w, n in t["here"].items())
         logger.info(f"[flashhead] reply: {t['face']} to the face, {sum(t['here'].values())} played here"
                     + (f" ({here})" if here else "") + f", slowest /speak {t['slow']} ms")
-    if not _ready["ok"]:
+    if not _ready["ok"] and not (t and t["face"]):   # words of this reply are at the face: it is told the reply ended, even after a /speak that failed
         return
     try:
         sid = quote(str(meta.get("stream_id") or ""))

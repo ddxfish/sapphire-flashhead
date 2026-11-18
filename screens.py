@@ -39,9 +39,10 @@ def _feed():
 
 
 def _mode():
-    """off | talking | always, as core says (avatar_feed.mode_for): off unless Settings > Devices >
-    Settings chose FlashHead as her face, else the strongest mode her screens ask for. Each screen's
-    own mode is set on its Devices page (2026-11-12; this was the plugin's `screens` setting)."""
+    """off | rest | talking | always, as core says (avatar_feed.mode_for): off unless Settings >
+    Devices > Settings chose FlashHead as her face, rest while it is and no board answers (the seat
+    is kept), else the strongest mode her screens ask for. Each screen's own mode is set on its
+    Devices page (2026-11-12; this was the plugin's `screens` setting)."""
     try:
         return _feed().mode_for(NAME)
     except Exception:
@@ -89,7 +90,7 @@ def on_settings_saved(settings):
 
 def wake():
     """A reply starts: have the boards open and the server's stream read before its first words."""
-    if _mode() == "off" or not _ours:
+    if _mode() in ("off", "rest") or not _ours:   # rest: no board to open, her reply waits for none
         return
     _wake.set()
     _feed().wake(NAME, wait=0.3)
@@ -139,6 +140,10 @@ def _run():
             if not _register():
                 _stop.wait(10)                   # another avatar is her face: ask again when it may have let go
                 continue
+        if mode == "rest":                       # her face, and no board answers now: the seat is kept, the server left alone
+            _wake.wait(5)
+            _wake.clear()
+            continue
         if mode != "always":
             _wake.wait(5)
             if not _wake.is_set() or _stop.is_set() or _again.is_set():
@@ -171,7 +176,7 @@ def _watch(feed, mode, voiced):
     try:
         # board=1: the whole packet always, her voice tagged with its device. Asked for only when a
         # board takes her voice in the stream: a frames-only viewer never makes the server take her sound.
-        with faces.http().get(f"{faces.base_url()}/stream?audio={int(voiced)}&board={int(voiced)}", stream=True, timeout=(5, 30)) as r:
+        with faces.http().get(f"{faces.base_url()}/stream?who=screens&audio={int(voiced)}&board={int(voiced)}", stream=True, timeout=(5, 30)) as r:
             _voiced = voiced
             _connected.set()
             raw = r.raw

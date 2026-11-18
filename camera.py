@@ -4,9 +4,12 @@ A viewer of the FlashHead server, like screens.py, on this computer (client
 mode too). Each 0.96 s packet is cut into frames, each with its slice of her
 voice, and one 25 fps tick sends both: the frame to a virtual camera
 (pyvirtualcam: OBS's on Windows, a v4l2loopback device on Linux), her voice to
-a virtual mic (VB-Cable on Windows, a PipeWire source on Linux). A queue past
-MAX_S loses its oldest, so she stays near now. Between her words her idle face
-plays on; with no stream her still face holds: a call wants a steady picture.
+a virtual mic (VB-Cable on Windows, a PipeWire source on Linux). Her words are
+kept whole: the server sends them seconds early (its TALK_AHEAD) and the queue
+holds them all, as a browser does, so her voice here and her face there stay
+together. A queue past MAX_S in the quiet skips her idle, so she is near now
+again. Between her words her idle face plays on; with no stream her still face
+holds: a call wants a steady picture.
 
 Settings (Webcam tab): `camera` on/off; `camera_voice` the camera carries her
 voice (no other viewer plays it then, server.py call=1); `camera_hear` her
@@ -25,6 +28,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -35,21 +39,40 @@ logger = logging.getLogger(__name__)
 
 W, H, FPS, SR = 1280, 720, 25, 24000     # 16:9: a call crops a square camera; SR = server.py PLAY_SR
 TICK = SR // FPS                          # her voice per frame
-MAX_S = 2.0
+MAX_S = 2.0                               # in the quiet: a queue past this skips her idle
+BANK_S = 8.0                              # her words: all the server sends early (TALK_AHEAD 4 s and a chunk) behind a camera
+                                          # as late as the quiet lets it be (MAX_S and a chunk): 7.9 s. At 6 a late camera lost a word
 MAX_DELAY_MS = 2000
 CABLE = "CABLE Input"                     # VB-Cable's playback end: the call picks "CABLE Output" as its mic
+CUSHION = 3                               # ticks of her voice a sound device's buffer keeps in hand (120 ms): what covers a late tick
+OVER_S = 0.75                             # in the quiet: this much more than her idle is sent ahead (the packet's "lead") is a camera behind
 PW_PROPS = '{ media.class=Audio/Source node.name=sapphire-voice node.description="Sapphire Voice" }'
 
-_stop = threading.Event()
+_stop = threading.Event()                 # the camera thread's own: each start makes a new one
+_thread = None
 _again = threading.Event()                # settings saved or Retry: start over
-_state = {"status": "off", "error": "", "device": "", "mic": "", "mic_ms": 0}
+_state = {"status": "off", "error": "", "device": "", "mic": "", "mic_ms": 0, "hear": ""}
 _lag = 0                                  # ticks her picture waits for her voice (camera_delay)
 _opened = None                            # what the camera is open with, her delay aside: only a change in these reopens it
+_sync = {"at": 0.0, "text": ""}           # the last time this camera fell behind her words, for the panel
+SYNC_S = 600
+
+
+def sync():
+    """{"text", "at", "ago"} for ten minutes after her webcam lost words, else None (routes/api.py status)."""
+    ago = time.time() - _sync["at"]
+    return {**_sync, "ago": int(ago)} if _sync["text"] and ago < SYNC_S else None
 
 
 def start(plugin_loader, settings):
-    _stop.clear()
-    threading.Thread(target=_run, daemon=True, name="flashhead-camera").start()
+    global _stop, _thread
+    old = _thread
+    stop()                                # a thread from before a quick off and on ends: clearing its flag kept it, two cameras
+    if old is not None and old.is_alive():
+        old.join(2)                       # and has let go of the camera: OBS's takes one sender, the new thread found it held and went dark for 30 s
+    _stop = threading.Event()
+    _thread = threading.Thread(target=_run, args=(_stop,), daemon=True, name="flashhead-camera")
+    _thread.start()
 
 
 def stop():
@@ -101,18 +124,18 @@ def status():
     return dict(_state)
 
 
-def _run():
-    while not _stop.is_set():
+def _run(stop):
+    while not stop.is_set():
         _again.clear()
         s = faces.settings()
         if not s.get("camera"):
-            _state.update(status="off", error="", device="", mic="", mic_ms=0)
+            _state.update(status="off", error="", device="", mic="", mic_ms=0, hear="")
             _again.wait()
             continue
         try:
-            _serve(s)
+            _serve(s, stop)
         except Exception as e:
-            _state.update(status="error", error=_words(e), device="", mic="", mic_ms=0)
+            _state.update(status="error", error=_words(e), device="", mic="", mic_ms=0, hear="")
             logger.warning(f"[flashhead] webcam: {_state['error']}")
             _again.wait(30)
 
@@ -130,9 +153,10 @@ def _words(e):
     return text
 
 
-def _serve(s):
+def _serve(s, stop=None):
     global _lag, _opened
     import pyvirtualcam
+    stop = stop or _stop
     outs = []
     _lag = _ticks(s)
     device = str(s.get("camera_device") or "").strip() or None
@@ -144,16 +168,18 @@ def _serve(s):
                 if s.get("camera_hear"):
                     outs.append(_Speaker(None))
             mic_ms = round(outs[0].latency * 1000) if outs else 0
-            _state.update(status="on", error="", device=cam.device, mic=outs[0].name if outs else "", mic_ms=mic_ms)
+            hear = outs[1].name if len(outs) > 1 else ""
+            _state.update(status="on", error="", device=cam.device, mic=outs[0].name if outs else "", mic_ms=mic_ms, hear=hear)
             _opened = _rest(s)
             logger.info(f"[flashhead] her face on webcam {cam.device}"
                         + (f", her voice on {outs[0].name} ({mic_ms} ms to the device)" if outs else ", no voice")
+                        + (f" and on this computer's speakers ({hear})" if hear else "")
                         + f", picture delay {_lag * 1000 // FPS} ms")
             feed = _Feed(bool(outs))
             still = shown = _canvas(_still(s))
             hush = np.zeros(TICK, np.int16)
             line = deque()                       # her picture on its way to the camera: JPEGs, small
-            while not _stop.is_set() and not _again.is_set():
+            while not stop.is_set() and not _again.is_set():
                 unit = feed.next()
                 pcm, pic = hush, None
                 if unit:
@@ -161,7 +187,7 @@ def _serve(s):
                     pcm = voice if voice is not None and len(voice) == TICK else hush
                 elif not feed.live:
                     pic = still
-                pic = _late(line, pic, _lag)
+                pic = _late(line, pic, _lag + (getattr(outs[0], "ticks", 0) if outs else 0))   # her voice waits in its device's buffer: her picture as long
                 if pic is not None:
                     try:
                         shown = pic if isinstance(pic, np.ndarray) else _canvas(pic)
@@ -170,14 +196,21 @@ def _serve(s):
                 cam.send(shown)
                 for o in outs:
                     o.write(pcm)
+                    if pcm is hush and getattr(o, "lost", 0):       # said once she is quiet
+                        text = (f"her voice on {o.name} fell behind and lost {o.lost / FPS:.1f} s of her words: that device takes "
+                                "sound slower than it is sent, or this computer was too busy")
+                        logger.warning(f"[flashhead] {text}")
+                        _sync.update(at=time.time(), text=text)
+                        o.lost = 0
                 cam.sleep_until_next_frame()
         finally:
             if feed:
                 feed.close()
             for o in outs:
                 o.close()
-            _opened = None
-            _state.update(status="off", device="", mic="", mic_ms=0)
+            if stop is _stop:                    # a thread a new start replaced leaves the new one's state alone
+                _opened = None
+                _state.update(status="off", device="", mic="", mic_ms=0, hear="")
             logger.info("[flashhead] webcam off")
 
 
@@ -221,6 +254,7 @@ class _Feed:
         self.voice = voice
         self.units, self.lock = deque(), threading.Lock()
         self.live, self.done, self.resp = False, threading.Event(), None
+        self.lost = 0                           # ticks of her words dropped at BANK_S, said when she is quiet again
         threading.Thread(target=self._run, daemon=True, name="flashhead-camera-feed").start()
 
     def next(self):
@@ -261,7 +295,7 @@ class _Feed:
         if path:                                # the server renders nothing without a face
             url, body, headers = faces.face_body(path, s)
             http.post(f"{base}{url}", data=body, headers=headers, timeout=5)
-        with http.get(f"{base}/stream?" + ("audio=1&call=1" if self.voice else "audio=0"),
+        with http.get(f"{base}/stream?who=webcam&" + ("audio=1&call=1" if self.voice else "audio=0"),
                       stream=True, timeout=(5, 30)) as r:
             r.raise_for_status()
             self.resp, self.live = r, True
@@ -278,19 +312,25 @@ class _Feed:
                 self.fed = True
                 body = _read(raw, size + sum(frames))
                 voice = np.frombuffer(body[:size], np.int16) if size else None
-                if not frames:                  # her voice without a face (a failed render): the last frame holds
-                    with self.lock:
-                        self.units.extend((None, voice[i:i + TICK]) for i in range(0, len(voice) - TICK + 1, TICK))
-                    continue
-                n, at, units = len(frames), size, []
-                for i, size in enumerate(frames):
+                n, at = len(frames), size
+                units = [(None, voice[i:i + TICK]) for i in range(0, len(voice) - TICK + 1, TICK)] if not frames else []
+                for i, size in enumerate(frames):   # none: her voice without a face (a failed render), the last frame holds
                     units.append((body[at:at + size],
                                   None if voice is None else voice[len(voice) * i // n:len(voice) * (i + 1) // n]))
                     at += size
+                if head.get("kind") != "speech" and self.lost:
+                    text = (f"her webcam fell behind and dropped {self.lost / FPS:.1f} s of her words: this computer was too busy "
+                            f"to send the camera its {FPS} pictures a second (its CPU), or the camera stalled")
+                    logger.warning(f"[flashhead] {text}")
+                    _sync.update(at=time.time(), text=text)
+                    self.lost = 0
                 with self.lock:
+                    if head.get("kind") != "speech" and len(self.units) > min(MAX_S, head.get("lead", MAX_S) + OVER_S) * FPS:
+                        continue                # behind in the quiet: this second of her idle is skipped, never her words
                     self.units.extend(units)
-                    while len(self.units) > MAX_S * FPS:
-                        self.units.popleft()
+                    while len(self.units) > BANK_S * FPS:   # past all the server sends early: this camera fell behind
+                        if self.units.popleft()[1] is not None:
+                            self.lost += 1
 
 
 def _mic(s):
@@ -303,12 +343,24 @@ def _mic(s):
 
 
 class _Speaker:
-    """Her voice to one output device (sounddevice), a tick at a time. At most
-    0.4 s waits: a slow device loses her oldest words, never drifts from her face."""
+    """Her voice to one output device (sounddevice), a tick at a time. The
+    camera's tick and the device's clock are two clocks, so her voice waits
+    in a buffer held at one level: CUSHION ticks over what the device takes
+    at once. A late tick is covered by it instead of heard as a hole, and
+    her picture waits as long (`ticks`), so the two stay together. The level
+    is put right in the quiet only (a silent tick left out, or given twice),
+    never in her words. Unheld, each hiccup left her voice later than her
+    face for good, up to 0.4 s, and from there her words lost 40 ms at a
+    time (scouts 2026-11-17). Run dry, it waits for the level again: one
+    pause, not a hole a tick. 0.4 s over the level her oldest words go (`lost`)."""
 
     def __init__(self, name, latency=None):     # None: the device's default, its long one
         import sounddevice as sd
-        self.buf, self.lock = deque(), threading.Lock()
+        self.buf, self.have, self.lock = deque(), 0, threading.Lock()
+        self.block = 0                          # the most the device has taken at once
+        self.going = False                      # the level was reached: she plays
+        self.fix = 0                            # the level is over (-1) or under (1): put right at the next silent tick
+        self.lost = 0                           # ticks of her dropped past the cap
         tries = [None] if name is None else [i for i, d in enumerate(sd.query_devices())
                                               if d["max_output_channels"] > 0 and name.lower() in d["name"].lower()]
         if not tries:
@@ -326,19 +378,43 @@ class _Speaker:
         else:
             raise RuntimeError(f"'{name}' would not open: {err}")
         self.name = sd.query_devices(self.stream.device)["name"]
-        self.latency = self.stream.latency      # what the device says of itself; a cable adds its own, unseen
+        self.latency = self.stream.latency + CUSHION / FPS     # what the device says of itself, and her wait here; a cable adds its own, unseen
         self.stream.start()
+
+    @property
+    def need(self):
+        """The level before the device takes its block: CUSHION ticks are left after it."""
+        return self.block + CUSHION * TICK
+
+    @property
+    def ticks(self):
+        """How long her voice waits here, in ticks: her picture is held back as long."""
+        return round((CUSHION * TICK + self.block / 2) / TICK)
+
+    def _put(self, pcm):
+        self.buf.append(pcm)
+        self.have += len(pcm)
 
     def write(self, pcm):
         with self.lock:
-            self.buf.append(pcm)
-            while len(self.buf) > 10:
-                self.buf.popleft()
+            if self.fix and not pcm.any():      # the quiet: the level is put right, a tick at a time
+                fix, self.fix = self.fix, 0
+                if fix < 0:
+                    return
+                self._put(pcm)
+            self._put(pcm)
+            while self.have > self.need + 10 * TICK:
+                self.have -= len(self.buf.popleft())
+                self.lost += 1
 
     def _fill(self, out, frames, t, status):
         n = 0
         with self.lock:
-            while n < frames and self.buf:
+            self.block = max(self.block, min(frames, SR // 4))
+            self.fix = -1 if self.have > self.need + TICK else 1 if self.have < self.need - TICK else 0
+            if not self.going and self.have >= self.need:
+                self.going = True
+            while self.going and n < frames and self.buf:
                 c = self.buf[0]
                 k = min(len(c), frames - n)
                 out[n:n + k, 0] = c[:k]
@@ -347,6 +423,9 @@ class _Speaker:
                 else:
                     self.buf[0] = c[k:]
                 n += k
+                self.have -= k
+            if self.going and n < frames:
+                self.going = False              # ran dry: quiet until the level is back
         out[n:, 0] = 0
 
     def close(self):

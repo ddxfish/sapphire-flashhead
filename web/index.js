@@ -170,7 +170,7 @@ function mountWebcam(el) {
         try {
             const c = await (await fetch(`${BASE}/camera`)).json();
             $('.fh-cam').textContent = c.status === 'on'
-                ? `On: camera ${c.device}${c.mic ? `, her voice on ${c.mic} (${c.mic_ms} ms to the device)` : ', no voice'}`
+                ? `On: camera ${c.device}${c.mic ? `, her voice on ${c.mic} (${c.mic_ms} ms to the device)` : ', no voice'}${c.hear ? `, and on this computer's speakers (${c.hear})` : ''}`
                 : c.status === 'error' ? c.error : 'Off';
             $('.fh-cam-install').hidden = c.installed;
             $('.fh-cam-retry').hidden = !(c.installed && c.status === 'error');

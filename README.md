@@ -69,7 +69,7 @@ Her live face as a camera, and her voice as a mic, that a call or stream can pic
 
 While the webcam is on, her face renders all the time: cheap with the calm loop, but with *Live* the GPU stays busy. With *Her voice as a mic* on, her voice goes only to the call; turn on *Hear her here too* to also hear her on this computer's speakers. If something's missing, the Webcam tab says what to install.
 
-**Her lips move before her voice.** A virtual cable and the call's own mic buffer make her voice late. *Picture delay (ms)* on the Webcam tab holds her picture back to meet it: start near the ms the tab's status line gives for her mic, then go up in steps of 40. It changes as she plays; the camera stays on. *Shorter mic buffer* asks the sound device for less delay to begin with (turn it off if her voice crackles); set it first, then the picture delay.
+**Her lips move before her voice.** A virtual cable and the call's own mic buffer make her voice late. *Picture delay (ms)* on the Webcam tab holds her picture back to meet it: start near the ms the tab's status line gives for her mic, then go up in steps of 40. It changes as she plays; the camera stays on. *Shorter mic buffer* asks the sound device for less delay to begin with (turn it off if her voice crackles); set it first, then the picture delay. On Windows her voice waits about 120 ms in the sound device's buffer before it plays, so a busy moment is not heard as a hole in her words, and her picture is held back as long by itself: the delay you set comes on top, and stays right through a long call.
 
 ## Her face on another screen
 
@@ -80,6 +80,19 @@ While the webcam is on, her face renders all the time: cheap with the calm loop,
 `./flashhead-bench.sh` or `flashhead-bench.bat` (in the env that renders; inside Sapphire set `FLASHHEAD_ENV=sapphire-plugin-flashhead`) loads the model the way the server does, once per variant, and times real chunks: 0.96 s of speech in, 24 frames out. Variants: the three Video memory presets `full`, `lean`, `smallest` (the default run), `eager`, `compiled`, `sdpa`, `autotune`, and the pieces `res384`, `int8`, `int4`, `vae8`, `decode25`. `--face` and `--audio` give a picture and a recording for a strip of frames per variant (quality is for eyes, not timers); `--long 300` lets her run on for 5 minutes and reports whether her face drifts. Every variant reports the video memory it took. Results land in `user/models/flashhead/bench/`. It never downloads; run the server once first.
 
 RTX 5090, 1.5.0: Full 6.7x real time (0.14 s per chunk) holding 6.1 GB, Lean 8.1x and 3.65 GB, Smallest 8.3x and 2.97 GB, all holding her face for 5 minutes. Tried and dead: 256 px melts to a grey mask within 3 minutes, 2 or 3 sampling steps smear while she talks, CUDA graphs drift.
+
+## When her face and voice come apart
+
+After a reply where something was late, the server says what it was and whose trouble it is: one warning in `user/logs/flashhead-server.log` and in Sapphire's own log (`[flashhead] ...`), and for ten minutes an amber line under her face in the panel. A reply with nothing late says nothing. What it can name:
+
+- **The GPU was busy with other work**: a chunk took longer to render in this reply than it does alone (her voice engine, a local LLM, a game, a browser on the same GPU).
+- **This GPU is too slow alone**, or **its video memory is full** (a full card on Windows moves her face into system memory, where it crawls): a leaner Video memory preset is faster and smaller.
+- **The CPU was busy** packing her frames, or **another Sapphire shared this GPU**.
+- **Her words came late**: her voice engine or the LLM was slower than she speaks, and her face waited for them.
+- **The browser**: her voice paused there for longer than the server knows a reason for (the network, or that computer), its page was busy or froze, its audio stopped, or it fell behind her. A panel that fell behind skips her idle until it holds no more than she is sent ahead, never her words. A pause the server caused itself (late words, a late render) is never put on the browser.
+- **Her webcam fell behind** and dropped words.
+
+The numbers behind a verdict are the `speech run` and `viewer` lines beside it in the server's log.
 
 ## How it flows
 

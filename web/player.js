@@ -2,11 +2,17 @@
 // The stream is packets of (header, PCM, JPEG frames) for the same 0.96 s;
 // each is decoded whole, then its voice and frames are placed together on
 // WebAudio's clock, read where the ear is: the mouth can't drift from the voice.
+// Each packet goes after the last, so a page that froze comes back that long
+// behind her: in the quiet it skips her idle while it holds more than she is sent ahead, never her words.
 // While she speaks a ■ sits on her face: a tap stops her, here at once, at the
 // server (the rest of the reply) and at its source (the pump, by stream id).
 export const BASE = '/api/plugin/flashhead';
 const MARGIN = 0.15;            // a late packet (or the first) starts this far ahead: the audio path's own room
 const DECODE_AHEAD = 1.0;       // frames are decoded this long before their moment
+const OVER = 0.75;              // in the quiet: holding this much more than her idle is sent ahead (each idle packet says: head.lead,
+                                // more on a slow GPU) is a player left behind. That second of her idle is skipped; what she is sent ahead stays
+let cameBack = 0;               // when this tab was last shown again: frames do not run in a hidden one, and that is no freeze
+document.addEventListener('visibilitychange', () => { if (!document.hidden) cameBack = performance.now(); });
 export const csrf = () => document.querySelector('meta[name="csrf-token"]')?.content || '';
 
 function createPlayer(canvas, onTalk) {
@@ -14,7 +20,7 @@ function createPlayer(canvas, onTalk) {
     let ctx = null, abort = null, raf = 0, next = 0, frames = [], sources = [];
     let voiced = false, voiceEnd = 0, lastRaf = 0, clock = 0;
     let talkEnd = 0, talking = false, sid = '';     // her words being heard (voiced or mouthed here), and whose stream
-    const fresh = () => ({ packets: 0, gaps: 0, gap_s: 0, ahead: 0, ahead_min: 0, late: 0, stalls: 0, paused: 0 });
+    const fresh = () => ({ packets: 0, gaps: 0, gap_s: 0, ahead: 0, ahead_min: 0, ahead_max: 0, late: 0, stalls: 0, paused: 0, skipped: 0 });
     let st = fresh();                   // this reply's numbers: one line in her server log when she goes quiet
 
     // The moment now being heard: the device's own timestamp (WASAPI, USB,
@@ -33,7 +39,8 @@ function createPlayer(canvas, onTalk) {
     function draw(ms) {
         raf = requestAnimationFrame(draw);
         if (!ctx) return;
-        if (voiced && lastRaf && ms - lastRaf > 250 && ms - lastRaf < 5000) st.stalls++;   // the page froze mid-reply
+        const back = ms - cameBack < 1000;      // this tab was just shown again: what passed unseen is no freeze and no late frame
+        if (voiced && lastRaf && ms - lastRaf > 250 && ms - lastRaf < 5000 && !back) st.stalls++;   // the page froze mid-reply
         lastRaf = ms;
         const now = heard();
         if ((now < talkEnd) !== talking) onTalk(talking = now < talkEnd);
@@ -45,10 +52,10 @@ function createPlayer(canvas, onTalk) {
         }
         let show = null;
         while (frames.length && frames[0].t <= now) {
-            if (show) { drop(show); if (now - show.t > 0.1) st.late++; }     // never shown: its moment passed
+            if (show) { drop(show); if (now - show.t > 0.1 && !back) st.late++; }     // never shown: its moment passed
             show = frames.shift();
         }
-        if (show && !show.bmp) { drop(show); st.late++; show = null; }   // not decoded in time: the last frame holds
+        if (show && !show.bmp) { drop(show); if (!back) st.late++; show = null; }   // not decoded in time: the last frame holds
         if (show) {
             const px = Math.round(canvas.clientWidth * (window.devicePixelRatio || 1));
             if (px && canvas.width !== px) { canvas.width = canvas.height = px; g.imageSmoothingQuality = 'high'; }
@@ -83,19 +90,25 @@ function createPlayer(canvas, onTalk) {
     function schedule(head, bytes, off) {
         const audio = head.audio ? bytes.slice(off, off + head.audio) : null;
         let p = off + head.audio;
-        const blobs = document.hidden ? [] :    // a background tab: her voice plays on, frames nobody can see are dropped
-            head.frames.map(len => new Blob([bytes.subarray(p, p += len)], { type: 'image/jpeg' }));
+        const blobs = head.frames.map(len => new Blob([bytes.subarray(p, p += len)], { type: 'image/jpeg' }));
         place(head, audio, blobs);
     }
 
     function place(head, audio, blobs) {
         const dur = head.frames.length ? head.frames.length / head.fps : head.audio / 2 / head.sr;   // her voice without a face still takes its time
         const ahead = next - ctx.currentTime;   // what was still to play when this came
+        if (document.hidden) {                  // nobody draws in a hidden tab: frames whose moment passed go here, the seconds
+            const now = heard();                // still to come stay, so her mouth is there when the tab is shown again mid-reply
+            frames = frames.filter(f => f.t > now || (drop(f), false));
+        }
+        if (head.kind !== 'speech' && ahead > (head.lead ?? 1.5) + OVER) {
+            st.skipped += dur; voiced = false; return;      // this second of her idle is skipped: she is nearer now
+        }
         const t = ahead > 0.01 ? next : ctx.currentTime + MARGIN;      // on time: straight on, no gap; late: a fresh margin
         if (audio) {
             if (voiced && t > next + 0.02) { st.gaps++; st.gap_s += t - next; }     // she was mid-reply and this came late
             if (voiced) { st.ahead_min = st.packets > 1 ? Math.min(st.ahead_min, ahead) : ahead; }
-            st.packets++; st.ahead += Math.max(0, ahead);
+            st.packets++; st.ahead += Math.max(0, ahead); st.ahead_max = Math.max(st.ahead_max, ahead);
             voiced = true;
             voiceEnd = t + dur;
             const pcm = new Int16Array(audio.buffer);
@@ -116,7 +129,11 @@ function createPlayer(canvas, onTalk) {
 
     async function start() {
         ctx = new AudioContext();
-        ctx.onstatechange = () => { if (ctx && ctx.state !== 'running') st.paused++; };   // Windows: a device change or sleep stops the clock
+        ctx.onstatechange = () => {             // Windows: a device change or sleep stops the clock
+            if (!ctx || ctx.state === 'running') return;
+            st.paused++;
+            if (ctx.state === 'suspended') ctx.resume().catch(() => {});    // nothing else ever started it again: she stayed frozen and mute until Watch was clicked twice
+        };
         next = 0;
         abort = new AbortController();
         raf = requestAnimationFrame(draw);
@@ -226,6 +243,13 @@ function mountSay(root, watchFirst) {
     words.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); say(); } };
 }
 
+// Who is watching, in words beside the count: "viewers: 3" alone hid a webcam and a Pi.
+const WHO = { browser: 'browser panel', viewer: 'standalone viewer', webcam: 'webcam', screens: 'her screens' };
+function who(w) {
+    const names = Object.entries(w || {}).map(([k, n]) => (n > 1 ? `${n} ${WHO[k] || k}s` : WHO[k] || k));
+    return names.length ? ` (${names.join(', ')})` : '';
+}
+
 export function mount(root, { big = false } = {}) {
     const size = big ? 'min(80vh, 90vw)' : '100%';
     root.innerHTML = `
@@ -241,6 +265,7 @@ export function mount(root, { big = false } = {}) {
                 <button class="fh-settings btn" title="Faces, moods, idle and screens">⚙</button>
             </div>
             <div class="fh-status" style="font-size:var(--font-sm,12px);color:var(--text-muted);text-align:center;"></div>
+            <div class="fh-sync" hidden style="font-size:var(--font-sm,12px);color:var(--warning,#e0a030);text-align:center;"></div>
             ${big ? `<div style="width:${size};display:flex;gap:6px;align-items:stretch;">
                 <textarea class="fh-words" rows="2" placeholder="Words for her to say (Ctrl+Enter)"
                     style="flex:1;resize:vertical;padding:6px 8px;border-radius:var(--radius-md,8px);"></textarea>
@@ -271,10 +296,13 @@ export function mount(root, { big = false } = {}) {
             line = stuck ? (s.error || s.status)       // the reason, in words, alone
                 : !s.face_source ? 'No face yet: give her persona an avatar, or upload one in ⚙ › Faces'
                 : s.note || s.warning
-                || `${s.status} · face: ${s.face_source}${mood} · viewers: ${s.viewers ?? 0}`
+                || `${s.status} · face: ${s.face_source}${mood} · viewers: ${s.viewers ?? 0}${who(s.who)}`
                    + ({ viewer: ' · her voice: on the standalone viewer', webcam: ' · her voice: on the webcam call' }[s.voice_on] || '')
                    + (s.gpu?.speed ? ` · ${s.gpu.speed}x real time, ${s.gpu.took_gb} GB` : '');
             show();
+            const y = stuck ? null : s.sync;           // the last verdict on her face and voice: what was late, and whose trouble it is
+            $('.fh-sync').hidden = !y;
+            if (y) $('.fh-sync').textContent = `⚠ ${y.ago < 90 ? 'just now' : `${Math.round(y.ago / 60)} min ago`}: ${y.text}`;
             const key = `${s.face_source}|${s.mood}|${s.face_changed || ''}`;
             if (key !== faceKey) {                     // a face changed in Settings: the still follows
                 faceKey = key;

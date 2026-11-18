@@ -59,8 +59,21 @@ class Speaker:
         self.end = 0                    # where the last queued sample ends
         self.mark = (0, time.monotonic())
         self.latency = 0.1
-        self.stream = sd.OutputStream(samplerate=SR, channels=1, dtype="int16",
-                                      device=device, callback=self._fill)
+        # A name is matched here, and every match tried: Windows lists a device once per host API ("CABLE Input"
+        # is three or four), sounddevice refuses a name that fits several, and not every one takes 24 kHz mono.
+        tries = [device] if not isinstance(device, str) else [
+            i for i, d in enumerate(sd.query_devices()) if d["max_output_channels"] > 0 and device.lower() in d["name"].lower()]
+        if not tries:
+            raise RuntimeError(f"no output device called '{device}'")
+        err = None
+        for dev in tries:
+            try:
+                self.stream = sd.OutputStream(samplerate=SR, channels=1, dtype="int16", device=dev, callback=self._fill)
+                break
+            except Exception as e:
+                err = e
+        else:
+            raise RuntimeError(f"'{device}' would not open: {err}")
         self.latency = self.stream.latency
         self.stream.start()
 
@@ -352,7 +365,7 @@ class Player(QObject):
                     r = self.http.get(f"{self.base}/face", timeout=10)
                     if r.ok:
                         self.still.emit(QImage.fromData(r.content))
-                url = f"{self.base}/stream?lat={self.clock.latency:.3f}" + ("&audio=0" if self.mute else "&speaker=1")
+                url = f"{self.base}/stream?who=viewer&lat={self.clock.latency:.3f}" + ("&audio=0" if self.mute else "&speaker=1")
                 with self.http.get(url, stream=True, timeout=(10, 30)) as r:
                     if r.status_code != 200:
                         raise ConnectionError(words(r))

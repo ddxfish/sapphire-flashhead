@@ -19,7 +19,8 @@ and each is its own session: her face, her motion, her words, her viewers.
 One model; her words always go first. This computer's Sapphire is "local",
 on 127.0.0.1 with no key. The same calls serve both:
 
-  GET  /health          status, this session's viewers
+  GET  /health          status, this session's viewers, "sync": the last verdict on her face and
+                        voice ({"text", "at", "ago"}, ten minutes): what was late, and whose trouble it is
   POST /face?idle=      {"path": image} (local only) or the image itself
                         (Content-Type image/*) - animate this face; idle=loop|live|light;
                         soon=1: her words are on their way (a live idle leaves the GPU to her voice)
@@ -30,8 +31,9 @@ on 127.0.0.1 with no key. The same calls serve both:
                         whose own reply it is: its stream carries the voice whole and that
                         board plays it; every other face mouths it (2026-11-03). sid= core's
                         stream id, carried in each packet's header: a tap on her face names it
-  POST /viewer          a browser's numbers for the reply it played (JSON): one log line
-  POST /flush?by=       she was stopped: drop what is queued (by=viewer: a tap on her face, logged)
+  POST /viewer          a browser's numbers for the reply it played (JSON): one log line, and a verdict
+  POST /flush?by=       she was stopped: drop what is queued (by=viewer: a tap on her face, logged);
+                        words of a stopped reply still on their way are taken from /speak and spoken nowhere
   POST /end             her reply is over: its last words go out now (until then a
                         gap in her words holds the face, it never idles mid-reply)
   GET  /stream?audio=0  packets: >I header length, JSON header, s16 PCM, JPEG frames;
@@ -99,8 +101,14 @@ PLAY_SR = 24000          # Kokoro's native rate; what the viewer hears
 LEAD = 0.5               # seconds rendered ahead of the wall clock (at least 1.5 renders: see _pick)
 TALK_AHEAD = 4.0         # while her words wait, render this far ahead: a GPU hiccup (her voice engine, an LLM) under it is never heard
 VIEWER_QUEUE = 8
+WHO = ("browser", "viewer", "webcam", "screens")   # what a viewer says it is (/stream?who=): the count names them
 HOLD_S = 4.0             # mid-reply, her face waits this long for her next words before it idles
 BEAT = [0.0]             # when the render loop last came round: /speak takes no words from a stalled one
+LATE_S = 0.15            # a chunk this long after its moment is a pause her viewers hear (a browser's own margin)
+DRY_S = 2.0              # this much quiet in the middle of a reply, waiting for her words, is said
+BEHIND_S = 2.5           # a viewer holding this much more than was ever sent ahead is running behind her
+SYNC_S = 600             # a verdict stays on /health this long
+TOMB_S = 60              # a reply that was stopped takes no more words this long (its stream id is one reply's, never used again)
 
 _state = {"status": "starting", "error": None, "progress": None,
           "warning": None,      # ready, but the GPU is slower than real time
@@ -130,6 +138,11 @@ PRESET = PRESETS[PRESET_NAME]
 MEASURED = ROOT / "user" / "flashhead" / "measured.json"    # what each preset took and ran at on this card
 
 
+def _ahead():
+    """How far ahead of her viewers' clock her idle is made: enough to sit out a render and a half."""
+    return max(LEAD, 1.5 * P.get("render_s", 0))
+
+
 class Session:
     """One Sapphire using this worker: her face and motion on the GPU, her
     words waiting, her viewers. The model is one; between chunks the render
@@ -148,7 +161,8 @@ class Session:
         self.viewers = {}           # queue -> plays the sound (a browser) or frames only (a board)
         self.boards = set()         # viewers that are board streams (?board=1): the whole packet always, never s.voice; the board routes her voice by "device"
         self.voice = None           # the one viewer that plays her voice (the newest browser): two would echo
-        self.call = None            # her webcam's viewer with her voice: it keeps s.voice while it watches
+        self.calls = []             # her webcam's viewers with her voice, newest last: one keeps s.voice while it watches
+        self.who = {}               # viewer -> what it is (WHO): the count says who is watching
         self.everyone = False       # every viewer with sound plays her voice (setting voice_everywhere): rooms apart, no echo to fear
         self.speakers = set()       # viewers that are her speaker (the standalone viewer, not muted): a browser opened later never takes her voice from one
         self.feed = threading.Lock()    # /speak decodes one at a time, in arrival order: a slow one never lets the next jump ahead of it
@@ -168,6 +182,17 @@ class Session:
         self.run = None             # this speech run's numbers, logged in one line when it ends
         self.now_tag = None         # the tag of the chunk being rendered: a flush by sid knows whether that one goes too
         self.drops = 0              # packets a slow viewer lost, all time
+        self.said = 0.0             # when the words made so far in this reply end for her viewers
+        self.said_sid = ""          # and whose reply they are (core's stream id)
+        self.revoice = False        # a viewer came or went while her words were still to be heard: who plays her voice is looked at again when they are out
+        self.stopped = {}           # stream id -> when that reply was stopped: its words still on their way are not taken (TOMB_S)
+        self.join_at = 0.0          # when a viewer last joined: it holds nothing ahead, its pauses are no one's fault
+        self.busy = False           # a chunk of her words is being rendered now
+        self.fresh = False          # her viewers' clock just started: they hold nothing yet, the next chunk cannot be late for them
+        self.gpu_at = 0.0           # when the GPU last rendered for this session
+        self.dry = [0, 0.0]         # this reply: times her viewers ran out of words before the next came, and the seconds
+        self.ran = None             # (when the last speech run ended, the seconds of quiet in it this server knows of, whether a viewer joined in the middle)
+        self.sync = None            # {"at", "text"}: the last verdict on her face and voice, for /health and the panel
 
     def talking(self):
         return not self.speech.empty() or len(self.pending["a16"]) > 0
@@ -177,8 +202,15 @@ class Session:
         padded tail and a calm-loop chunk here broke her motion (reset, ~2 s
         to settle) in the middle of a long reply on a GPU near real time.
         Counted from when her last words END for her viewers, never from when
-        they came: a 20 s group arrives in one burst and plays out long after."""
-        return self.open and self.speech.empty() and time.monotonic() - self.heard < HOLD_S
+        they came: a 20 s group arrives in one burst and plays out long after.
+        The end of her last word (the part of a chunk that waits for more) is
+        not held past its moment: with her next words late it went out after
+        them, and she stopped inside a word ("sun", a pause, "ny"). It is
+        rendered just before her viewers run out, padded, and she holds on."""
+        now = time.monotonic()
+        if not (self.open and self.speech.empty() and now - self.heard < HOLD_S):
+            return False
+        return not (len(self.pending["a16"]) and now > self.heard - _ahead())
 
 
 def _session(name, door=False):
@@ -363,6 +395,7 @@ def _load():
             return
         _download()
         _state["status"] = "loading model"
+        import av  # noqa: F401  her voice's decoder, loaded now: on first use it made her first /speak slow (cold DLLs on Windows), and a slow one is taken as heard
         os.chdir(ENGINE)                      # the engine opens its yaml by relative path
         if str(ENGINE) not in sys.path:
             sys.path.insert(0, str(ENGINE))
@@ -618,6 +651,7 @@ def _render(s, a16):
     with _gpu:
         _pipe.original_color_reference, _pipe.ref_img_latent, _pipe.latent_motion_frames = s.t
         s.dq = np.concatenate((s.dq[len(a16):], a16))
+        s.gpu_at = time.monotonic()
         emb = fh.get_audio_embedding(_pipe, s.dq, P["start"], P["end"])
         with contextlib.redirect_stdout(io.StringIO()):   # per-step timing prints
             video = fh.run_pipeline(_pipe, emb)
@@ -674,13 +708,23 @@ def _queue_decoded(s, a16, a24, mute, device, taken, sid):
     tag = {"mute": bool(mute), "device": device or "", "taken": bool(taken),   # taken: a browser or a call plays it, so a board mouths it
            "sid": sid or ""}                                                   # sid: core's stream, so a tap on her face can stop it at the source
     with s.lock:
+        if not s.viewers:
+            return                               # the last viewer left while these were decoded: nobody hears them, and no old sentence waits for the next viewer
+        now = time.monotonic()
+        if not s.open:
+            s.said = 0.0                         # a new reply: nothing of it is made yet
+        elif s.run and s.said and (sid or "") == s.said_sid and s.speech.empty() and not s.busy and now - s.said > 0.3:
+            # every whole chunk of this reply made and played out before these came, and her face still holding
+            # for them: they are late, not her face. (Not after the hold: a tool at work is no stutter. Not another
+            # reply's: a stop that found nothing left her open, and the next reply's first words read as 95 s late.)
+            s.dry = [s.dry[0] + 1, s.dry[1] + now - s.said]
         p16 = np.concatenate((s.pending["a16"], a16))
         p24 = np.concatenate((s.pending["a24"], a24))
         while len(p16) >= P["n16"]:
             s.speech.put((p16[:P["n16"]], p24[:P["n24"]], tag))
             p16, p24 = p16[P["n16"]:], p24[P["n24"]:]
         s.pending.update(a16=p16, a24=p24, tag=tag)
-        s.open, s.heard = True, max(s.heard, time.monotonic())
+        s.open, s.heard = True, max(s.heard, now)
 
 
 def _next_chunk(s):
@@ -720,6 +764,7 @@ def _packet(kind, jpegs, a24, tag=None):
     audio = a24.tobytes() if a24 is not None else b""
     head = json.dumps({"kind": kind, "fps": P["fps"], "sr": PLAY_SR, "audio": len(audio),
                        "frames": [len(j) for j in jpegs],
+                       **({"lead": round(_ahead(), 2)} if kind == "idle" else {}),   # how far ahead her idle is sent: a viewer holding much more has fallen behind
                        **({"mute": tag["mute"], "device": tag["device"], "taken": tag["taken"], "sid": tag.get("sid", "")} if tag else {})}).encode()
     return struct.pack(">I", len(head)) + head + audio + b"".join(jpegs)
 
@@ -734,14 +779,21 @@ def _drain(s):
             return out
 
 
-def _flush(s, sid=None):
+def _flush(s, sid=None, dead=True):
     """Stop: drop queued speech here and tell viewers to drop what they
     scheduled. The chunk being rendered right now is dropped too (gen).
     `sid`: that reply (core's stream id) and no other's: a board's stop
     flushed everything, another chat's reply with it (scouts 2026-11-05).
-    Returns how many slices went."""
+    `dead`: the reply is over for good, and its words still on their way
+    are not taken (/speak): one in flight when she was stopped landed after
+    the stop and was spoken. Returns how many slices went."""
     head = json.dumps({"kind": "flush"}).encode()
+    now = time.monotonic()
     with s.lock:
+        tags = [t for *_, t in list(s.speech.queue)] + [s.now_tag, s.pending.get("tag")]
+        if dead:
+            s.stopped = {k: t for k, t in s.stopped.items() if now - t < TOMB_S}
+            s.stopped.update({i: now for i in ([sid] if sid else [t["sid"] for t in tags if t and t.get("sid")])})
         if sid:
             kept, dropped = [], 0
             for item in _drain(s):
@@ -769,7 +821,7 @@ def _flush(s, sid=None):
             s.pending.update(a16=np.zeros(0, np.float32), a24=np.zeros(0, np.int16))
         _broadcast(s, struct.pack(">I", len(head)) + head)
         if s.clock is not None:
-            s.clock = [time.monotonic(), 0.0]    # her viewers dropped what was banked: seconds ahead no more, her idle comes now
+            s.clock, s.fresh = [now, 0.0], True  # her viewers dropped what was banked: seconds ahead no more, her idle comes now
     return dropped
 
 
@@ -777,10 +829,22 @@ def _voice_of(s):
     """The one viewer that plays her voice (two would echo): her webcam's call,
     else the newest speaker (a standalone viewer playing sound), else the newest
     browser. Under _viewers_lock."""
-    if s.call is not None:
-        return s.call
+    if s.calls:
+        return s.calls[-1]
     sound = [v for v, on in s.viewers.items() if on and v not in s.boards]
     return next((v for v in reversed(sound) if v in s.speakers), sound[-1] if sound else None)
+
+
+def _revoice(s):
+    """A viewer came or went: who plays her voice is looked at again. While her
+    words are still to be heard, the viewer that holds them keeps it: it has
+    seconds of her banked, and a browser that took her voice mid-reply played
+    the next words over them (live 2026-11-17: two parts of one reply at once
+    for 4 s). When they are out (_pick), the newest takes it. Under _viewers_lock."""
+    if s.voice in s.viewers and (s.talking() or time.monotonic() < s.heard):
+        s.revoice = True
+    else:
+        s.voice, s.revoice = _voice_of(s), False
 
 
 def _broadcast(s, pkt, quiet=None, hush=None):
@@ -820,7 +884,11 @@ def _packer():
         quiet = hush = None
         try:
             if pkt is None:
+                t = time.perf_counter()
                 jpegs = [_jpeg(f) for f in frames]
+                r = s.run
+                if r and kind == "speech":
+                    r["pack"].append(time.perf_counter() - t)
                 pkt = _packet(kind, jpegs, a24, tag)
                 if a24 is not None:
                     quiet = _packet(kind, jpegs, None, tag) if jpegs else b""
@@ -839,17 +907,20 @@ def _pick():
     ahead of their own clock): her words first, then a calm loop (no GPU),
     then a live idle render. A live idle never holds up anyone's words."""
     now, best = time.monotonic(), None
-    ahead = max(LEAD, 1.5 * P.get("render_s", 0))   # a talker keeps enough lead to sit out one other render
+    ahead = _ahead()                        # a talker keeps enough lead to sit out one other render
     with _viewers_lock:                     # a viewer leaving clears s.clock under this same lock
         for s in _sessions.values():
             if not (s.viewers and s.want):
                 continue
+            if s.revoice:
+                _revoice(s)
             if s.clock is None:
-                s.clock = [now, 0.0]
+                s.clock, s.fresh = [now, 0.0], True
             lead = s.clock[1] - (now - s.clock[0])
             if lead < -2.0:                         # fell behind (GPU busy): rebase
-                if s.run:
-                    s.run["rebases"] += 1
+                r = s.run                           # a viewer leaving ends the run on its own thread
+                if r:
+                    r["rebases"] += 1
                 s.clock, lead = [now, 0.0], 0.0
             if lead > (TALK_AHEAD if s.talking() else ahead):    # her words waiting: bank them, the viewers hold the seconds
                 continue
@@ -904,6 +975,7 @@ def _turn():
     kind, a16, a24, tag = _next_chunk(s)
     s.now_tag = tag if kind == "speech" else None
     gen, t = s.gen, time.perf_counter()
+    r = None
     try:
         pkt = None
         if kind == "idle" and s.run:
@@ -927,19 +999,23 @@ def _turn():
             s.live, s.rest, s.last = False, [], None
         else:
             r = s.run = s.run or {"n": 0, "render": [], "lead": [], "waits": 0, "waiting": False,
-                                  "resets": 0, "rebases": 0, "drops": s.drops}
+                                  "resets": 0, "rebases": 0, "drops": s.drops, "late": [], "pack": [],
+                                  "quiet": 0.0,             # seconds her viewers had nothing of her in the middle of it, whoever's fault
+                                  "at": time.monotonic(), "cpu": _cpu()}
             if not s.live:
                 _reset_motion(s)
                 s.live = True
                 r["resets"] += 1
             s.build = None                      # her motion moved on: a calm loop half made starts again
             s.rest, s.last, s.soon = [], None, 0.0
+            s.busy = True
             frames = _render(s, a16)
             r["n"] += 1
             r["render"].append(time.perf_counter() - t)
             r["lead"].append(s.lead)
-            r["waiting"] = False
+            waited, r["waiting"] = r["waiting"], False
     except Exception as e:
+        s.busy = False
         logger.exception(f"Render failed ({s.name})")
         if a24 is not None:
             _out.put((s, gen, kind, [], a24, None, tag))   # her words still reach whoever took them, without a face
@@ -955,11 +1031,25 @@ def _turn():
         return
     s.fails = _failing[0] = 0
     _out.put((s, gen, kind, frames, a24, pkt, tag))
+    s.busy = False
     c = s.clock                             # a viewer leaving may clear it meanwhile
-    if c:
-        c[1] += P["chunk_s"]
-        if kind == "speech":
-            s.heard = max(s.heard, c[0] + c[1])     # her words are heard until this chunk ends: the hold counts from there
+    if not c or gen != s.gen:               # stopped while it rendered: never sent, and no part of the clock the stop started
+        return
+    fresh, s.fresh = s.fresh, False
+    late = time.perf_counter() - t - s.lead     # rendered and handed on: how long after her viewers ran out of her?
+    if fresh or late > 0:
+        # They hold nothing and start from this chunk: so does the clock. Left where it was, it took the seconds
+        # they had waited as still owed and sent them as idle, and every viewer stayed that far behind for good
+        # (live 2026-11-17: +1.9 s after one pause in her words). The -2 s rebase in _pick was the only anchor.
+        c[0] = time.monotonic() - c[1]
+    if r is not None and late > 0 and not fresh:
+        r["quiet"] += late
+        if late > LATE_S and not waited:    # after a wait for her words it is late for them, not for this
+            r["late"].append(late)
+    c[1] += P["chunk_s"]
+    if kind == "speech":
+        s.heard = max(s.heard, c[0] + c[1])     # her words are heard until this chunk ends: the hold counts from there
+        s.said, s.said_sid = c[0] + c[1], (tag or {}).get("sid", "")
 
 
 def _run_end(s):
@@ -968,13 +1058,100 @@ def _run_end(s):
     words arriving late (waits) from a slow viewer (drops) from a reset in
     the middle of a reply (resets > 1)."""
     r, s.run = s.run, None
-    if not r or not r["n"]:
+    if not r or not r["render"]:            # its first chunk still rendering (a viewer left meanwhile): no numbers yet
         return
     rd, ld = r["render"], r["lead"]
+    dry, s.dry = s.dry, [0, 0.0]
     logger.info(f"speech run ({s.name}): {r['n']} chunks ({r['n'] * P['chunk_s']:.1f}s), "
                 f"render {min(rd):.2f}/{sum(rd) / len(rd):.2f}/{max(rd):.2f}s for {P['chunk_s']:.2f}s, "
                 f"lead {min(ld):+.2f}..{max(ld):+.2f}s, waits {r['waits']}, resets {r['resets']}, "
-                f"rebases {r['rebases']}, drops {s.drops - r['drops']}")
+                f"rebases {r['rebases']}, drops {s.drops - r['drops']}, late {len(r['late'])}, "
+                f"words late {dry[0]} ({dry[1]:.1f}s)")
+    why = _verdict(s, r, dry)
+    s.ran = (time.monotonic(), r["quiet"], s.join_at > r["at"])
+    if why:
+        _say(s, why)
+
+
+def _cpu():
+    """(busy, all) seconds of every core so far, or None: psutil is not promised in this env."""
+    try:
+        import psutil
+        t = psutil.cpu_times()
+        return sum(t) - t.idle - getattr(t, "iowait", 0), sum(t)
+    except Exception:
+        return None
+
+
+def _spare(r):
+    """What this computer had to spare, for a verdict: (GB of video memory free
+    now or None, the same in words with the CPU's load over the run and the
+    system memory in use, where psutil is here). Nothing here is needed to render."""
+    free, words = None, []
+    try:
+        import torch
+        free = torch.cuda.mem_get_info(0)[0] / 1e9
+        words.append(f"{free:.1f} GB of video memory free")
+    except Exception:
+        pass
+    was, now = r.get("cpu"), _cpu()
+    if was and now and now[1] > was[1]:
+        import psutil
+        words.append(f"CPU {100 * (now[0] - was[0]) / (now[1] - was[1]):.0f}% busy, "
+                     f"system memory {psutil.virtual_memory().percent:.0f}% in use")
+    return free, ", ".join(words)
+
+
+def _verdict(s, r, dry):
+    """Why her face and voice came late or apart in this reply, in words that
+    name whose trouble it is, or None: nothing a viewer would notice. The
+    numbers of the run's line, read: full video memory, a GPU too slow alone,
+    a GPU busy with other work, a busy CPU, another Sapphire on this GPU, her
+    words late from her voice engine, a viewer too slow to take her."""
+    rd = r["render"]
+    avg, worst = sum(rd) / len(rd), max(rd)
+    P["best"] = min(P.get("best") or P.get("render_s") or worst, min(rd))   # the warm-up runs while Sapphire still loads her other models: the best chunk seen is this GPU alone
+    parts, chunk, alone = [], P["chunk_s"], P["best"]
+    if r["late"]:
+        free, spare = _spare(r)
+        pack = sum(r["pack"]) / len(r["pack"]) if r["pack"] else 0
+        with _viewers_lock:
+            others = sum(1 for x in _sessions.values() if x is not s and x.gpu_at > r["at"])   # rendered during this reply
+        leaner = "" if PRESET_NAME == "smallest" else " A leaner Video memory preset (Settings > FlashHead) is faster."
+        if free is not None and free < 0.4:
+            why = ("its video memory is full" + (": Windows moves her face into system memory, where it crawls"
+                                                 if sys.platform == "win32" else "")
+                   + ". Close what else uses this GPU." + leaner)
+        elif alone > 0.9 * chunk:
+            why = f"this GPU renders her at {chunk / alone:.1f}x real time with nothing else running, too slow to keep up." + leaner
+        elif alone and (avg > 1.5 * alone or worst > 2.5 * alone):
+            why = "the GPU was busy with other work (her voice engine, a local LLM, a game, a browser on the same GPU)."
+        elif pack > 0.3:
+            why = f"the CPU was busy: packing a chunk's frames took {pack:.2f} s."
+        elif others:
+            why = f"{others} other Sapphire{'s' if others > 1 else ''} shared this GPU."
+        else:
+            why = "the cause is not in these numbers."
+        parts.append(f"her face came late {len(r['late'])}x in this reply (by up to {max(r['late']):.1f} s): {why} "
+                     f"A chunk of {chunk:.2f} s took {avg:.2f} s to render (worst {worst:.2f} s"
+                     + (f", {alone:.2f} s alone" if alone else "") + ")" + (f"; {spare}" if spare else ""))
+    if dry[1] >= DRY_S:
+        parts.append(f"her words came late {dry[0]}x ({dry[1]:.1f} s of quiet in the middle of the reply): "
+                     "her voice engine or the LLM was slower than she speaks, her face waited for them")
+    if s.drops > r["drops"]:
+        parts.append(f"{s.drops - r['drops']} packets of her never reached a viewer too slow to take them "
+                     "(its network, or a frozen page)")
+    return "; ".join(parts) or None
+
+
+def _say(s, text):
+    """A verdict: a warning in this log, and on /health for the panel and Sapphire's own log.
+    One within half a minute of the last is the same reply's: they are said together."""
+    logger.warning(f"sync ({s.name}): {text}")
+    old = s.sync
+    if old and time.time() - old["at"] < 30:
+        text = f"{old['text']}; {text}"
+    s.sync = {"at": round(time.time(), 3), "text": text}
 
 
 def _viewer_log(s, data):
@@ -988,10 +1165,44 @@ def _viewer_log(s, data):
     except (ValueError, AttributeError):
         return
     logger.info(f"viewer ({s.name}): {v.get('packets', 0):.0f} packets, gaps {v.get('gaps', 0):.0f} "
-                f"({v.get('gap_s', 0):.2f}s), ahead avg/min {v.get('ahead', 0):.2f}/{v.get('ahead_min', 0):.2f}s, "
+                f"({v.get('gap_s', 0):.2f}s), ahead avg/min/max {v.get('ahead', 0):.2f}/{v.get('ahead_min', 0):.2f}/{v.get('ahead_max', 0):.2f}s, "
                 f"late frames {v.get('late', 0):.0f}, page stalls {v.get('stalls', 0):.0f}, "
                 f"audio out {v.get('out', 0):.3f}s ({'the device clock' if v.get('clock') else 'reported'}), {v.get('sr', 0):.0f} Hz"
-                + (f", audio paused {v['paused']:.0f}x" if v.get("paused") else ""))
+                + (f", audio paused {v['paused']:.0f}x" if v.get("paused") else "")
+                + (f", skipped {v['skipped']:.1f}s of her idle to catch up" if v.get("skipped") else ""))
+    why = _viewer_verdict(s, v)
+    if why:
+        _say(s, why)
+
+
+def _viewer_verdict(s, v):
+    """The same for what only the browser sees: her voice paused there for
+    longer than this server knows a reason for (the network, or that
+    computer), a page too busy to show her frames, its audio stopped, a
+    player that fell behind her."""
+    parts = []
+    ran = s.ran if s.ran and time.monotonic() - s.ran[0] < 60 else None
+    # A pause there is blamed on the network or that computer only for what this server cannot account for itself:
+    # the quiet it knows of in that reply (her words late, a render late) is taken off, and with no run to set it
+    # against, or a viewer that joined in the middle (it held nothing ahead), nothing is said. Wrong blame is worse than none.
+    more = v.get("gap_s", 0) - (ran[1] if ran else 0)
+    if v.get("gaps") and more >= 1.0 and ran and not ran[2]:
+        parts.append(f"her voice paused {v['gaps']:.0f}x ({v['gap_s']:.1f} s) in the browser, {more:.1f} s of it with her sent on time "
+                     "from here: the network between them, or that computer was busy")
+    if v.get("stalls") or v.get("late", 0) > max(12, 0.05 * v.get("packets", 0) * P.get("fps", 25)):
+        parts.append(f"the browser's page was busy: {v.get('late', 0):.0f} of her frames missed their moment"
+                     + (f", the page froze {v['stalls']:.0f}x" if v.get("stalls") else "")
+                     + " (that computer's CPU or GPU, or a heavy page)")
+    if v.get("paused"):
+        parts.append(f"the browser's audio stopped {v['paused']:.0f}x (a device change, or the computer slept)")
+    over = v.get("ahead_max", 0) - TALK_AHEAD - P.get("chunk_s", 1)     # more than was ever sent ahead
+    if over > BEHIND_S:
+        parts.append(f"the browser ran about {over:.0f} s behind her while she spoke (its page had stopped for a while, or its "
+                     "sound runs slow): it catches up when she is quiet")
+    if v.get("skipped", 0) >= 1.5:
+        parts.append(f"the browser had fallen {v['skipped']:.0f} s behind her (its page had stopped for a while, or its sound "
+                     "runs slow) and skipped ahead in the quiet")
+    return "; ".join(parts) or None
 
 
 def _inside(path):
@@ -1058,10 +1269,13 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/health":
             with _viewers_lock:
                 viewers, listeners = len(s.viewers), sum(s.viewers.values())
-                voice_on = ("webcam" if s.voice is not None and s.voice is s.call
+                who = {k: n for k in WHO if (n := sum(1 for w in s.who.values() if w == k))}
+                voice_on = ("webcam" if s.voice is not None and s.voice in s.calls
                             else "viewer" if s.voice in s.speakers else "browser" if s.voice is not None else None)
+            sync = s.sync if s.sync and time.time() - s.sync["at"] < SYNC_S else None
             info = {**_state, "note": s.note or _state["note"], "face": bool(s.face),
-                    "viewers": viewers, "listeners": listeners, "voice_on": voice_on}
+                    "viewers": viewers, "who": who, "listeners": listeners, "voice_on": voice_on,
+                    "sync": sync and {**sync, "ago": int(time.time() - sync["at"])}}
             if getattr(self.server, "door", None) and info["error"]:
                 info["error"] = _private(info["error"])
             return self._json(info)
@@ -1069,21 +1283,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "not found"}, 404)
         q = queue.Queue(maxsize=VIEWER_QUEUE)
         args = parse_qs(url.query)
+        who = args.get("who", [""])[0]
+        who = who if who in WHO else "browser"
         with _viewers_lock:
             s.viewers[q] = args.get("audio", ["1"])[0] != "0"
+            s.who[q] = who
             if args.get("board", ["0"])[0] == "1":
                 s.boards.add(q)                  # a board stream: the whole packet always, never the voice tab
             elif s.viewers[q] and args.get("call", ["0"])[0] == "1":
-                s.call = q                       # a call hears her: a browser opened mid-call never takes her voice from it
+                s.calls.append(q)                # a call hears her: a browser opened mid-call never takes her voice from it
             elif s.viewers[q] and args.get("speaker", ["0"])[0] == "1":
                 s.speakers.add(q)                # her speaker (the standalone viewer): the app page's Speak never takes her voice from it
-            s.voice = _voice_of(s)
+            _revoice(s)
+            s.join_at = time.monotonic()
             _watching.set()
         try:                                     # what the browser says its audio path adds (Bluetooth: 0.15-0.3 s)
             lat = f", audio out {float(parse_qs(url.query)['lat'][0]):.3f}s"
         except (KeyError, ValueError, IndexError):
             lat = ""
-        logger.info(f"Viewer joined ({s.name}: {len(s.viewers)}{lat}"
+        logger.info(f"Viewer joined ({s.name}: {len(s.viewers)}, {who}{lat}"
                     + (", plays her voice" if s.voice is q and len(s.viewers) > 1 else "") + ")")
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
@@ -1108,11 +1326,12 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _viewers_lock:
                 s.viewers.pop(q, None)
+                s.who.pop(q, None)
                 s.boards.discard(q)
                 s.speakers.discard(q)
-                if s.call is q:
-                    s.call = None
-                s.voice = _voice_of(s)
+                if q in s.calls:
+                    s.calls.remove(q)            # the call's other stream, if one is open, keeps her voice (a stream left over from a reconnect took it away as it closed)
+                _revoice(s)
                 last = not s.viewers
                 if last:
                     s.clock = None
@@ -1130,7 +1349,7 @@ class Handler(BaseHTTPRequestHandler):
             if gone:
                 shutil.rmtree(FACES / s.name, ignore_errors=True)
                 logger.info(f"{s.name} is no longer let in: its stream is closed and its faces deleted")
-            logger.info(f"Viewer left ({s.name}: {len(s.viewers)})")
+            logger.info(f"Viewer left ({s.name}: {len(s.viewers)}, {who})")
 
     def do_POST(self):
         s = self._caller(post=True)
@@ -1178,9 +1397,14 @@ class Handler(BaseHTTPRequestHandler):
                    else "no face" if not s.want or not (s.face or os.path.exists(s.want))
                    else "stalled" if time.monotonic() - BEAT[0] > 15 else "")
             if why:                              # no face to give, or the loop stalled: she speaks at home
+                sid = query.get("sid", [""])[0][:64]
+                if why == "stalled" and sid and _flush(s, sid=sid, dead=False):   # words of this reply taken before the stall, unheard: dropped, or they came out late over the rest of it at home
+                    logger.warning(f"The render loop stalled ({s.name}): this reply's words waiting here are dropped, the rest of it plays at home")
                 return self._json({"taken": False, "why": why})
+            take = query.get("take", ["0"])[0] == "1"
+            if time.monotonic() - s.stopped.get(query.get("sid", [""])[0][:64], -TOMB_S) < TOMB_S:
+                return self._json({"taken": take, "why": "stopped"})     # she was stopped: these were on their way, and are spoken nowhere
             try:
-                take = query.get("take", ["0"])[0] == "1"
                 taken = take and any(sound for v, sound in s.viewers.items() if v not in s.boards)   # a browser or a call plays it; a board stream is not a listener here (it mouths what others play)
                 _queue_speech(s, data, mute=not taken, device=query.get("device", [""])[0], taken=taken,   # played elsewhere: a viewer playing it too was a late echo; a board stream still carries it to the device named
                               sid=query.get("sid", [""])[0][:64])
